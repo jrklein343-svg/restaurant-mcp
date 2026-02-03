@@ -83,40 +83,58 @@ export class ResyClient {
     }
   }
 
+  // Search does NOT require authentication - it's a public endpoint
   async search(query: string, location: string, date: string, partySize: number): Promise<ResySearchResult[]> {
     interface FindResponse {
       search: { hits: Array<{ id: { resy: number }; name: string; location: { name: string; neighborhood: string }; cuisine: string[]; price_range: number; rating: number }> };
     }
-    const data = await this.request<FindResponse>('get', '/4/find', {
-      lat: 0, long: 0, day: date, party_size: partySize, query: `${query} ${location}`.trim(),
-    });
-    return (data.search?.hits || []).map((hit) => ({
-      id: hit.id.resy,
-      name: hit.name,
-      location: hit.location?.name || '',
-      neighborhood: hit.location?.neighborhood || '',
-      cuisine: Array.isArray(hit.cuisine) ? hit.cuisine.join(', ') : '',
-      priceRange: hit.price_range || 0,
-      rating: hit.rating || 0,
-    }));
+    try {
+      const searchQuery = `${query} ${location}`.trim();
+      console.log(`[Resy] Searching: query="${searchQuery}", date=${date}, partySize=${partySize}`);
+      const response = await this.client.get<FindResponse>('/4/find', {
+        params: { lat: 0, long: 0, day: date, party_size: partySize, query: searchQuery },
+        headers: { 'Authorization': `ResyAPI api_key="${this.apiKey}"` },
+      });
+      const hits = response.data.search?.hits || [];
+      console.log(`[Resy] Found ${hits.length} results`);
+      return hits.map((hit) => ({
+        id: hit.id.resy,
+        name: hit.name,
+        location: hit.location?.name || '',
+        neighborhood: hit.location?.neighborhood || '',
+        cuisine: Array.isArray(hit.cuisine) ? hit.cuisine.join(', ') : '',
+        priceRange: hit.price_range || 0,
+        rating: hit.rating || 0,
+      }));
+    } catch (error) {
+      console.error('[Resy] Search error:', error instanceof Error ? error.message : error);
+      return [];
+    }
   }
 
+  // Get availability does NOT require authentication - it's a public endpoint
   async getAvailability(venueId: number, date: string, partySize: number): Promise<ResySlot[]> {
     interface VenueSlotsResponse {
       results: { venues: Array<{ slots: Array<{ config: { id: number; type: string; token: string }; date: { start: string; end: string } }> }> };
     }
-    const data = await this.request<VenueSlotsResponse>('get', '/4/find', {
-      lat: 0, long: 0, day: date, party_size: partySize, venue_id: venueId,
-    });
-    const venue = data.results?.venues?.[0];
-    if (!venue?.slots) return [];
-    return venue.slots.map((slot) => ({
-      slotId: String(slot.config.id),
-      token: slot.config.token,
-      time: slot.date.start,
-      endTime: slot.date.end,
-      type: slot.config.type,
-    }));
+    try {
+      const response = await this.client.get<VenueSlotsResponse>('/4/find', {
+        params: { lat: 0, long: 0, day: date, party_size: partySize, venue_id: venueId },
+        headers: { 'Authorization': `ResyAPI api_key="${this.apiKey}"` },
+      });
+      const venue = response.data.results?.venues?.[0];
+      if (!venue?.slots) return [];
+      return venue.slots.map((slot) => ({
+        slotId: String(slot.config.id),
+        token: slot.config.token,
+        time: slot.date.start,
+        endTime: slot.date.end,
+        type: slot.config.type,
+      }));
+    } catch (error) {
+      console.error('[Resy] Availability error:', error instanceof Error ? error.message : error);
+      return [];
+    }
   }
 
   async getBookingDetails(configId: string, date: string, partySize: number): Promise<{ bookToken: string; paymentMethodId?: number }> {
