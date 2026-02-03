@@ -1,9 +1,10 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import http from 'http';
 import { z } from 'zod';
 
 import {
@@ -657,23 +658,90 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // Start server
+const PORT = parseInt(process.env.PORT || '3000', 10);
+
 async function main() {
   // Start the snipe scheduler
   await startScheduler();
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  // Track active transports
+  const transports = new Map<string, SSEServerTransport>();
+
+  // Create HTTP server for SSE
+  const httpServer = http.createServer(async (req, res) => {
+    // CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    // Health check
+    if (req.url === '/health' || req.url === '/') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', service: 'restaurant-mcp' }));
+      return;
+    }
+
+    // SSE endpoint
+    if (req.url === '/sse' && req.method === 'GET') {
+      const transport = new SSEServerTransport('/message', res);
+      const sessionId = Date.now().toString();
+      transports.set(sessionId, transport);
+
+      res.on('close', () => {
+        transports.delete(sessionId);
+      });
+
+      await server.connect(transport);
+      return;
+    }
+
+    // Message endpoint for SSE
+    if (req.url === '/message' && req.method === 'POST') {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', async () => {
+        // Find an active transport and handle the message
+        for (const transport of transports.values()) {
+          try {
+            await transport.handlePostMessage(req, res, body);
+            return;
+          } catch {
+            // Try next transport
+          }
+        }
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'No active session' }));
+      });
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+  });
+
+  httpServer.listen(PORT, () => {
+    console.log(`Restaurant MCP server running on port ${PORT}`);
+    console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
+  });
 
   // Cleanup on exit
   process.on('SIGINT', () => {
     cache.destroy();
     stopScheduler();
+    httpServer.close();
     process.exit(0);
   });
 
   process.on('SIGTERM', () => {
     cache.destroy();
     stopScheduler();
+    httpServer.close();
     process.exit(0);
   });
 }

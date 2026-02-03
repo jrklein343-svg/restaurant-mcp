@@ -1,866 +1,684 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import express from 'express';
 import { z } from 'zod';
-import { resyClient } from './resy-client.js';
-import { openTableClient } from './opentable-client.js';
-import { resyDiagnostic, KNOWN_VENUES } from './resy-diagnostic.js';
-import { logger } from './logger.js';
-import { randomUUID } from 'crypto';
-import axios from 'axios';
 
-const app = express();
-const PORT = parseInt(process.env.PORT || '3000', 10);
+import {
+  setCredential,
+  getCredential,
+  getResyAuthStatus,
+  getOpenTableAuthStatus,
+} from './credentials.js';
+import { resyClient } from './platforms/resy.js';
+import { openTableClient } from './platforms/opentable.js';
+import { tockClient } from './platforms/tock.js';
+import { parseRestaurantId } from './platforms/base.js';
+import {
+  findTable,
+  searchRestaurant,
+  getRestaurantById,
+  getRestaurantsByIds,
+  getRestaurantDetails,
+  checkAvailability,
+  getBookingOptions,
+  getPlatformHealth,
+  getAvailablePlatforms,
+  getPlatformClient,
+} from './services/search.js';
+import { rateLimiter } from './services/rate-limiter.js';
+import { cache } from './services/cache.js';
+import type { PlatformName, ReservationParams } from './types/restaurant.js';
+import {
+  snipeReservation,
+  snipeReservationSchema,
+  listScheduledSnipes,
+  listSnipesSchema,
+  cancelSnipe,
+  cancelSnipeSchema,
+} from './tools/snipe.js';
+import { startScheduler, stopScheduler } from './sniper/scheduler.js';
 
-// Helper: Parse date from various formats
-function parseDate(input: string | undefined): string {
-  if (!input) return new Date().toISOString().split('T')[0];
-  if (/^\d{4}-\d{2}-\d{2}$/.test(input)) return input;
-  const date = new Date(input);
-  if (isNaN(date.getTime())) {
-    throw new Error(`Invalid date: ${input}. Use YYYY-MM-DD format or natural language.`);
-  }
-  return date.toISOString().split('T')[0];
-}
-
-// Helper: Parse restaurant ID
-function parseRestaurantId(input: string | number): { id: number; platform: 'resy' | 'opentable' | null } {
-  const str = String(input);
-  if (str.toLowerCase().startsWith('resy-')) {
-    return { id: parseInt(str.slice(5), 10), platform: 'resy' };
-  }
-  if (str.toLowerCase().startsWith('opentable-')) {
-    return { id: parseInt(str.slice(10), 10), platform: 'opentable' };
-  }
-  return { id: parseInt(str, 10), platform: null };
-}
-
-// Helper: Parse party size
-function parsePartySize(input: string | number | undefined): number {
-  if (!input) return 2;
-  const size = typeof input === 'string' ? parseInt(input, 10) : input;
-  if (isNaN(size) || size < 1 || size > 20) return 2;
-  return size;
-}
-
-// Flexible schemas
-const searchSchema = z.object({
-  query: z.string().min(1),
-  location: z.string().min(1),
-  date: z.string().optional(),
-  partySize: z.union([z.string(), z.number()]).optional(),
-  party_size: z.union([z.string(), z.number()]).optional(), // alias
-  platform: z.enum(['resy', 'opentable', 'both']).optional(),
+// Schemas for tool inputs
+const findTableSchema = z.object({
+  restaurant: z.string().min(1).max(100).describe('Restaurant name'),
+  location: z.string().min(1).max(100).describe('City or neighborhood'),
+  date: z.string().describe('Date (YYYY-MM-DD) or relative like "friday", "tomorrow"'),
+  time: z.string().describe('Preferred time like "noon", "7pm", "around 8"'),
+  party_size: z.number().int().min(1).max(20).default(2).describe('Number of guests'),
+  book: z.boolean().default(true).describe('Automatically book the best available slot'),
 });
 
-const availabilitySchema = z.object({
-  restaurantId: z.union([z.string(), z.number()]),
-  restaurant_id: z.union([z.string(), z.number()]).optional(), // alias
-  platform: z.enum(['resy', 'opentable']).optional(),
-  date: z.string(),
-  partySize: z.union([z.string(), z.number()]).optional(),
-  party_size: z.union([z.string(), z.number()]).optional(), // alias
+const searchRestaurantSchema = z.object({
+  name: z.string().min(1).max(100).describe('Restaurant name to search for'),
+  location: z.string().min(1).max(100).describe('City or neighborhood'),
+  date: z.string().optional().describe('Optional date for availability context (YYYY-MM-DD)'),
+  party_size: z.number().int().min(1).max(20).default(2).describe('Party size'),
 });
 
-const reserveSchema = z.object({
-  restaurantId: z.union([z.string(), z.number()]),
-  restaurant_id: z.union([z.string(), z.number()]).optional(), // alias
-  platform: z.enum(['resy', 'opentable']).optional(),
-  slotId: z.string(),
-  slot_id: z.string().optional(), // alias
-  date: z.string(),
-  partySize: z.union([z.string(), z.number()]).optional(),
-  party_size: z.union([z.string(), z.number()]).optional(), // alias
+const getRestaurantSchema = z.object({
+  restaurant_id: z.string().min(1).describe('Restaurant ID in format "platform-id" (e.g., resy-12345, opentable-67890, tock-venue-slug)'),
 });
 
-const cancelSchema = z.object({
-  reservationId: z.string(),
-  reservation_id: z.string().optional(), // alias
+const getRestaurantsSchema = z.object({
+  restaurant_ids: z.array(z.string()).min(1).max(20).describe('Array of restaurant IDs to look up'),
 });
 
-// Create MCP server
-function createServer(): Server {
-  const server = new Server(
-    {
-      name: 'restaurant-reservations',
-      version: '1.0.0',
+const checkAvailabilitySchema = z.object({
+  restaurant_id: z.string().min(1).describe('Restaurant ID (e.g., resy-12345, opentable-67890, tock-abc)'),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('Date to check (YYYY-MM-DD)'),
+  party_size: z.number().int().min(1).max(20).describe('Number of guests'),
+});
+
+const makeReservationSchema = z.object({
+  restaurant_id: z.string().min(1).describe('Restaurant ID'),
+  slot_id: z.string().min(1).describe('Time slot ID from check_availability'),
+  party_size: z.number().int().min(1).max(20).describe('Number of guests'),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('Reservation date (YYYY-MM-DD)'),
+});
+
+
+const getBookingOptionsSchema = z.object({
+  restaurant_id: z.string().min(1).describe('Restaurant ID'),
+});
+
+const listReservationsSchema = z.object({
+  platform: z.enum(['resy', 'opentable', 'tock', 'all']).default('all').describe('Platform filter'),
+});
+
+const cancelReservationSchema = z.object({
+  reservation_id: z.string().min(1).describe('Reservation ID to cancel'),
+  platform: z.enum(['resy', 'opentable', 'tock']).describe('Platform'),
+});
+
+const setCredentialsSchema = z.object({
+  platform: z.enum(['resy', 'opentable']).describe('Platform to set credentials for'),
+  api_key: z.string().optional().describe('API key (required for Resy)'),
+  auth_token: z.string().optional().describe('Authentication token'),
+});
+
+const setLoginSchema = z.object({
+  platform: z.enum(['resy']).describe('Platform (currently only Resy supported)'),
+  email: z.string().email().describe('Account email'),
+  password: z.string().min(1).describe('Account password'),
+});
+
+const checkAuthStatusSchema = z.object({
+  platform: z.enum(['resy', 'opentable', 'tock', 'all']).default('all').describe('Platform to check'),
+});
+
+const refreshTokenSchema = z.object({
+  platform: z.enum(['resy']).describe('Platform to refresh token for'),
+});
+
+// Create server
+const server = new Server(
+  {
+    name: 'restaurant-reservations',
+    version: '2.0.0',
+  },
+  {
+    capabilities: {
+      tools: {},
     },
-    {
-      capabilities: {
-        tools: {},
+  }
+);
+
+// Tool definitions
+const tools = [
+  {
+    name: 'find_table',
+    description: 'Find and book a table at a restaurant. Searches by name, checks availability for your date/time/party size, and books the best matching slot. Returns confirmation or booking URL.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        restaurant: { type: 'string', description: 'Restaurant name (e.g., "Carbone", "The Grill")' },
+        location: { type: 'string', description: 'City or neighborhood (e.g., "New York", "Manhattan")' },
+        date: { type: 'string', description: 'Date - YYYY-MM-DD or relative like "friday", "tomorrow"' },
+        time: { type: 'string', description: 'Preferred time like "noon", "7pm", "around 8"' },
+        party_size: { type: 'number', default: 2, description: 'Number of guests' },
+        book: { type: 'boolean', default: true, description: 'Auto-book best slot (true) or just show options (false)' },
       },
-    }
-  );
-
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
-      {
-        name: 'search_restaurants',
-        description: `Search for restaurants on Resy and OpenTable.
-
-EXAMPLES:
-- search_restaurants(query: "Italian", location: "New York")
-- search_restaurants(query: "Carbone", location: "NYC", partySize: 4)
-- search_restaurants(query: "sushi", location: "Los Angeles", platform: "resy")
-
-DEFAULTS: partySize=2, platform=both (searches Resy + OpenTable), date=today`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            query: { type: 'string', description: 'Restaurant name, cuisine, or search term' },
-            location: { type: 'string', description: 'City or neighborhood (e.g., "New York", "SF", "Los Angeles")' },
-            date: { type: 'string', description: 'Date for availability (optional, defaults to today)' },
-            partySize: { type: ['string', 'number'], description: 'Number of guests (optional, defaults to 2)' },
-            platform: { type: 'string', enum: ['resy', 'opentable', 'both'], description: 'Where to search (optional, defaults to both)' },
-          },
-          required: ['query', 'location'],
-        },
+      required: ['restaurant', 'location', 'date', 'time', 'party_size'],
+    },
+  },
+  {
+    name: 'search_restaurant',
+    description: 'Search for a restaurant by name and location. Returns matching restaurants with their IDs.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        name: { type: 'string', description: 'Restaurant name to search for' },
+        location: { type: 'string', description: 'City or neighborhood' },
+        date: { type: 'string', description: 'Optional date for context (YYYY-MM-DD)' },
+        party_size: { type: 'number', default: 2, description: 'Party size' },
       },
-      {
-        name: 'check_availability',
-        description: `Get available time slots for a restaurant.
-
-EXAMPLES:
-- check_availability(restaurantId: "resy-12345", date: "2026-02-15", partySize: 2)
-- check_availability(restaurantId: 12345, platform: "resy", date: "2026-02-15")
-
-The restaurantId comes from search_restaurants results.`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            restaurantId: { type: ['string', 'number'], description: 'Restaurant ID from search results (e.g., "resy-12345" or 12345)' },
-            platform: { type: 'string', enum: ['resy', 'opentable'], description: 'Platform (can be auto-detected from restaurantId prefix)' },
-            date: { type: 'string', description: 'Date (YYYY-MM-DD or natural language)' },
-            partySize: { type: ['string', 'number'], description: 'Number of guests (defaults to 2)' },
-          },
-          required: ['restaurantId', 'date'],
-        },
+      required: ['name', 'location'],
+    },
+  },
+  {
+    name: 'get_restaurant',
+    description: 'Look up a restaurant by its platform-specific ID. Returns full details including name, address, cuisine, hours, contact info, and booking options.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        restaurant_id: { type: 'string', description: 'Restaurant ID (e.g., resy-12345, opentable-67890, tock-venue-slug)' },
       },
-      {
-        name: 'make_reservation',
-        description: `Book a reservation. For Resy: books directly. For OpenTable: returns booking URL.
-
-EXAMPLE:
-- make_reservation(restaurantId: "resy-12345", slotId: "config_token_here", date: "2026-02-15", partySize: 2)
-
-The slotId comes from check_availability results.`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            restaurantId: { type: ['string', 'number'], description: 'Restaurant ID' },
-            platform: { type: 'string', enum: ['resy', 'opentable'], description: 'Platform (auto-detected from ID prefix)' },
-            slotId: { type: 'string', description: 'Time slot ID from availability check' },
-            date: { type: 'string', description: 'Reservation date' },
-            partySize: { type: ['string', 'number'], description: 'Number of guests' },
-          },
-          required: ['restaurantId', 'slotId', 'date'],
-        },
+      required: ['restaurant_id'],
+    },
+  },
+  {
+    name: 'get_restaurants',
+    description: 'Look up multiple restaurants by their IDs in a single call.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        restaurant_ids: { type: 'array', items: { type: 'string' }, description: 'Array of restaurant IDs to look up' },
       },
-      {
-        name: 'list_reservations',
-        description: 'List your upcoming Resy reservations. No parameters needed.',
-        inputSchema: { type: 'object', properties: {} },
+      required: ['restaurant_ids'],
+    },
+  },
+  {
+    name: 'check_availability',
+    description: 'Get available time slots for a specific restaurant on a given date.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        restaurant_id: { type: 'string', description: 'Restaurant ID (e.g., resy-12345)' },
+        date: { type: 'string', description: 'Date to check (YYYY-MM-DD)' },
+        party_size: { type: 'number', description: 'Number of guests' },
       },
-      {
-        name: 'cancel_reservation',
-        description: 'Cancel a Resy reservation by ID.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            reservationId: { type: 'string', description: 'The reservation ID to cancel' },
-          },
-          required: ['reservationId'],
-        },
+      required: ['restaurant_id', 'date', 'party_size'],
+    },
+  },
+  {
+    name: 'make_reservation',
+    description: 'Book a reservation. For Resy, completes booking directly. For OpenTable/Tock, returns a booking URL.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        restaurant_id: { type: 'string', description: 'Restaurant ID' },
+        slot_id: { type: 'string', description: 'Time slot ID from check_availability' },
+        party_size: { type: 'number', description: 'Number of guests' },
+        date: { type: 'string', description: 'Reservation date (YYYY-MM-DD)' },
       },
-      {
-        name: 'check_auth_status',
-        description: 'Check if Resy authentication is working. No parameters needed.',
-        inputSchema: { type: 'object', properties: {} },
+      required: ['restaurant_id', 'slot_id', 'party_size', 'date'],
+    },
+  },
+  {
+    name: 'get_booking_options',
+    description: 'Get all ways to book a restaurant: API booking, website URLs, and phone number.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        restaurant_id: { type: 'string', description: 'Restaurant ID' },
       },
-      {
-        name: 'get_venue_availability',
-        description: `Get availability for a known Resy venue ID directly (bypasses search).
-
-EXAMPLES:
-- get_venue_availability(venueId: 1505, date: "2026-02-15", partySize: 2)  // Carbone NYC
-- get_venue_availability(venueId: 25973, date: "2026-02-15", partySize: 4) // 4 Charles Prime Rib
-
-Common NYC venue IDs:
-- Carbone: 1505
-- Don Angie: 5765
-- Via Carota: 2567
-- 4 Charles Prime Rib: 25973
-- Le Coucou: 3013`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            venueId: { type: 'number', description: 'Resy venue ID (numeric)' },
-            date: { type: 'string', description: 'Date (YYYY-MM-DD)' },
-            partySize: { type: ['string', 'number'], description: 'Number of guests (defaults to 2)' },
-          },
-          required: ['venueId', 'date'],
-        },
+      required: ['restaurant_id'],
+    },
+  },
+  {
+    name: 'list_reservations',
+    description: 'View your upcoming reservations.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        platform: { type: 'string', enum: ['resy', 'opentable', 'tock', 'all'], default: 'all', description: 'Platform filter' },
       },
-      {
-        name: 'lookup_venue_id',
-        description: `Look up a Resy venue ID from a restaurant name or Resy URL.
-
-EXAMPLES:
-- lookup_venue_id(url: "https://resy.com/cities/ny/carbone")
-- lookup_venue_id(name: "Carbone", city: "ny")
-- lookup_venue_id(name: "Bestia", city: "la")
-
-City codes: ny, la, sf, chi, mia, dc, las-vegas, austin, denver, seattle, boston, etc.`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            url: { type: 'string', description: 'Full Resy URL (e.g., https://resy.com/cities/ny/carbone)' },
-            name: { type: 'string', description: 'Restaurant name (use with city)' },
-            city: { type: 'string', description: 'City code: ny, la, sf, chi, mia, dc, etc.' },
-          },
-        },
+    },
+  },
+  {
+    name: 'cancel_reservation',
+    description: 'Cancel an existing reservation.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        reservation_id: { type: 'string', description: 'Reservation ID to cancel' },
+        platform: { type: 'string', enum: ['resy', 'opentable', 'tock'], description: 'Platform' },
       },
-      {
-        name: 'diagnostic_search',
-        description: `DIAGNOSTIC: Search with verbose logging and multiple strategies.
-Tries: known venue lookup, geolocation search, basic search, fuzzy variations.
-Returns detailed attempt logs showing what worked and what failed.
-
-EXAMPLES:
-- diagnostic_search(query: "Juliet", location: "Culver City")
-- diagnostic_search(query: "Carbone", location: "New York")`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            query: { type: 'string', description: 'Restaurant name' },
-            location: { type: 'string', description: 'City or neighborhood' },
-            date: { type: 'string', description: 'Date (YYYY-MM-DD), defaults to today' },
-            partySize: { type: 'number', description: 'Number of guests (defaults to 2)' },
-          },
-          required: ['query', 'location'],
-        },
+      required: ['reservation_id', 'platform'],
+    },
+  },
+  {
+    name: 'set_credentials',
+    description: 'Securely store API credentials for Resy or OpenTable.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        platform: { type: 'string', enum: ['resy', 'opentable'], description: 'Platform' },
+        api_key: { type: 'string', description: 'API key (required for Resy)' },
+        auth_token: { type: 'string', description: 'Authentication token' },
       },
-      {
-        name: 'run_diagnostic_tests',
-        description: `DIAGNOSTIC: Run test suite against known restaurants.
-Tests Juliet (Culver City), Margot (Culver City), Carbone (NYC), Bestia (LA).
-Compares direct ID lookup vs search methods.`,
-        inputSchema: { type: 'object', properties: {} },
+      required: ['platform'],
+    },
+  },
+  {
+    name: 'set_login',
+    description: 'Store email/password for automatic token refresh. Credentials are encrypted.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        platform: { type: 'string', enum: ['resy'], description: 'Platform (currently only Resy)' },
+        email: { type: 'string', description: 'Account email' },
+        password: { type: 'string', description: 'Account password' },
       },
-      {
-        name: 'get_known_venues',
-        description: `List all known Resy venue IDs that can be used directly.
-Includes venues in NYC, LA, and Culver City.`,
-        inputSchema: { type: 'object', properties: {} },
+      required: ['platform', 'email', 'password'],
+    },
+  },
+  {
+    name: 'check_auth_status',
+    description: 'Check if credentials are configured and valid for each platform.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        platform: { type: 'string', enum: ['resy', 'opentable', 'tock', 'all'], default: 'all', description: 'Platform to check' },
       },
-      {
-        name: 'get_diagnostic_logs',
-        description: `Get recent diagnostic logs for debugging.
-Shows raw API requests, responses, and errors.`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            count: { type: 'number', description: 'Number of log entries (default 50)' },
-          },
-        },
+    },
+  },
+  {
+    name: 'refresh_token',
+    description: 'Manually refresh authentication token using stored login credentials.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        platform: { type: 'string', enum: ['resy'], description: 'Platform' },
       },
-      {
-        name: 'get_rate_limit_status',
-        description: `Check current rate limit status and request counts.`,
-        inputSchema: { type: 'object', properties: {} },
+      required: ['platform'],
+    },
+  },
+  {
+    name: 'snipe_reservation',
+    description: 'Schedule an automatic booking attempt for when slots become available. Perfect for popular restaurants.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        restaurant_id: { type: 'string', description: 'Restaurant ID' },
+        platform: { type: 'string', enum: ['resy', 'opentable'], description: 'Platform' },
+        date: { type: 'string', description: 'Target reservation date (YYYY-MM-DD)' },
+        party_size: { type: 'number', description: 'Number of guests' },
+        preferred_times: { type: 'array', items: { type: 'string' }, description: 'Preferred times in order' },
+        release_time: { type: 'string', description: 'When slots open (ISO 8601)' },
       },
-    ],
-  }));
+      required: ['restaurant_id', 'platform', 'date', 'party_size', 'preferred_times', 'release_time'],
+    },
+  },
+  {
+    name: 'list_snipes',
+    description: 'View all scheduled snipe attempts and their status.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {},
+    },
+  },
+  {
+    name: 'cancel_snipe',
+    description: 'Cancel a scheduled snipe attempt.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        snipe_id: { type: 'string', description: 'Snipe ID to cancel' },
+      },
+      required: ['snipe_id'],
+    },
+  },
+  {
+    name: 'get_platform_status',
+    description: 'Check the health and rate limit status of all platforms.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {},
+    },
+  },
+];
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
+// List tools handler
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  return { tools };
+});
 
-    try {
-      switch (name) {
-        case 'search_restaurants': {
-          const raw = searchSchema.parse(args);
-          const date = parseDate(raw.date);
-          const partySize = parsePartySize(raw.partySize || raw.party_size);
-          const platform = raw.platform || 'both';
+// Call tool handler
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
 
-          const results: any[] = [];
-          const errors: string[] = [];
+  try {
+    switch (name) {
+      case 'find_table': {
+        const input = findTableSchema.parse(args);
+        const result = await findTable(
+          input.restaurant,
+          input.location,
+          input.date,
+          input.time,
+          input.party_size,
+          input.book
+        );
 
-          const promises: Promise<void>[] = [];
-
-          if (platform === 'resy' || platform === 'both') {
-            promises.push(
-              resyClient.search(raw.query, raw.location, date, partySize)
-                .then((r) => r.forEach((x) => results.push({
-                  id: `resy-${x.id}`,
-                  name: x.name,
-                  location: x.location,
-                  neighborhood: x.neighborhood,
-                  cuisine: x.cuisine,
-                  priceRange: x.priceRange,
-                  rating: x.rating,
-                  platform: 'resy',
-                })))
-                .catch((e) => { errors.push(`Resy: ${e.message}`); })
-            );
-          }
-
-          if (platform === 'opentable' || platform === 'both') {
-            promises.push(
-              openTableClient.search(raw.query, raw.location)
-                .then((r) => r.forEach((x) => results.push({
-                  id: `opentable-${x.id}`,
-                  name: x.name,
-                  address: x.address,
-                  city: x.city,
-                  cuisine: x.cuisine,
-                  priceRange: x.priceRange,
-                  rating: x.rating,
-                  platform: 'opentable',
-                })))
-                .catch((e) => { errors.push(`OpenTable: ${e.message}`); })
-            );
-          }
-
-          await Promise.all(promises);
-
-          if (results.length === 0) {
-            return {
-              content: [{
-                type: 'text',
-                text: `No restaurants found for "${raw.query}" in ${raw.location}.${errors.length ? ` Errors: ${errors.join(', ')}` : ''} Try a different search term or location.`,
-              }],
-            };
-          }
-
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                query: raw.query,
-                location: raw.location,
-                date,
-                partySize,
-                resultCount: results.length,
-                results: results.slice(0, 20), // Limit to 20 results
-                note: results.length > 20 ? `Showing first 20 of ${results.length} results.` : undefined,
-              }, null, 2),
-            }],
-          };
-        }
-
-        case 'check_availability': {
-          const raw = availabilitySchema.parse(args);
-          const restaurantIdRaw = raw.restaurantId || raw.restaurant_id;
-          const { id: numericId, platform: detectedPlatform } = parseRestaurantId(restaurantIdRaw!);
-          const platform = raw.platform || detectedPlatform;
-          const date = parseDate(raw.date);
-          const partySize = parsePartySize(raw.partySize || raw.party_size);
-
-          if (!platform) {
-            return {
-              content: [{ type: 'text', text: 'Platform required. Use "resy" or "opentable", or prefix ID like "resy-12345".' }],
-              isError: true,
-            };
-          }
-
-          if (platform === 'resy') {
-            const slots = await resyClient.getAvailability(numericId, date, partySize);
-            if (slots.length === 0) {
-              return {
-                content: [{ type: 'text', text: `No availability found for restaurant ${numericId} on ${date} for ${partySize} guests.` }],
-              };
-            }
-            return {
-              content: [{
-                type: 'text',
-                text: JSON.stringify({
-                  platform: 'resy',
-                  restaurantId: numericId,
-                  date,
-                  partySize,
-                  slotCount: slots.length,
-                  slots: slots.map(s => ({
-                    time: s.time,
-                    slotId: s.slotId,
-                    type: s.type,
-                  })),
-                  note: 'Use the slotId with make_reservation to book.',
-                }, null, 2),
-              }],
-            };
-          } else {
-            const slots = await openTableClient.getAvailability(numericId, date, partySize);
-            if (slots.length === 0) {
-              return {
-                content: [{ type: 'text', text: `No availability found for restaurant ${numericId} on ${date} for ${partySize} guests.` }],
-              };
-            }
-            return {
-              content: [{
-                type: 'text',
-                text: JSON.stringify({
-                  platform: 'opentable',
-                  restaurantId: numericId,
-                  date,
-                  partySize,
-                  slotCount: slots.length,
-                  slots: slots.map(s => ({
-                    time: s.time,
-                    bookingUrl: s.bookingUrl,
-                  })),
-                  note: 'OpenTable requires completing booking on their website. Use the bookingUrl.',
-                }, null, 2),
-              }],
-            };
-          }
-        }
-
-        case 'make_reservation': {
-          const raw = reserveSchema.parse(args);
-          const restaurantIdRaw = raw.restaurantId || raw.restaurant_id;
-          const slotId = raw.slotId || raw.slot_id;
-          const { id: numericId, platform: detectedPlatform } = parseRestaurantId(restaurantIdRaw!);
-          const platform = raw.platform || detectedPlatform;
-          const date = parseDate(raw.date);
-          const partySize = parsePartySize(raw.partySize || raw.party_size);
-
-          if (!platform) {
-            return {
-              content: [{ type: 'text', text: 'Platform required. Use "resy" or "opentable", or prefix ID like "resy-12345".' }],
-              isError: true,
-            };
-          }
-
-          if (!slotId) {
-            return {
-              content: [{ type: 'text', text: 'slotId required. Get it from check_availability results.' }],
-              isError: true,
-            };
-          }
-
-          if (platform === 'opentable') {
-            const bookingUrl = `https://www.opentable.com/booking/experiences-availability?rid=${numericId}&datetime=${date}T${slotId}&covers=${partySize}`;
-            return {
-              content: [{
-                type: 'text',
-                text: JSON.stringify({
-                  success: true,
-                  platform: 'opentable',
-                  message: '⚠️ OpenTable requires completing booking on their website.',
-                  bookingUrl,
-                  instructions: 'Click the booking URL to complete your reservation on OpenTable.',
-                }, null, 2),
-              }],
-            };
-          }
-
-          const details = await resyClient.getBookingDetails(slotId, date, partySize);
-          const result = await resyClient.makeReservation(details.bookToken, details.paymentMethodId);
-
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                success: true,
-                message: '✅ Reservation confirmed!',
-                platform: 'resy',
-                reservationId: result.reservationId,
-                date,
-                partySize,
-              }, null, 2),
-            }],
-          };
-        }
-
-        case 'list_reservations': {
-          const reservations = await resyClient.getReservations();
-          if (reservations.length === 0) {
-            return {
-              content: [{ type: 'text', text: 'No upcoming reservations found.' }],
-            };
-          }
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                count: reservations.length,
-                reservations,
-              }, null, 2),
-            }],
-          };
-        }
-
-        case 'cancel_reservation': {
-          const raw = cancelSchema.parse(args);
-          const reservationId = raw.reservationId || raw.reservation_id;
-          if (!reservationId) {
-            return {
-              content: [{ type: 'text', text: 'reservationId required.' }],
-              isError: true,
-            };
-          }
-          await resyClient.cancelReservation(reservationId);
-          return {
-            content: [{ type: 'text', text: `✅ Reservation ${reservationId} cancelled.` }],
-          };
-        }
-
-        case 'check_auth_status': {
-          try {
-            await resyClient.ensureAuth();
-            return {
-              content: [{ type: 'text', text: '✅ Resy authentication is working.' }],
-            };
-          } catch (error) {
-            return {
-              content: [{
-                type: 'text',
-                text: `❌ Resy authentication failed: ${error instanceof Error ? error.message : 'Unknown'}`,
-              }],
-              isError: true,
-            };
-          }
-        }
-
-        case 'get_venue_availability': {
-          const venueId = (args as any).venueId || (args as any).venue_id;
-          const date = parseDate((args as any).date);
-          const partySize = parsePartySize((args as any).partySize || (args as any).party_size);
-
-          if (!venueId || typeof venueId !== 'number') {
-            return {
-              content: [{ type: 'text', text: 'venueId (number) is required. Example: venueId: 1505 for Carbone NYC' }],
-              isError: true,
-            };
-          }
-
-          console.log(`[Resy] Direct venue lookup: venueId=${venueId}, date=${date}, partySize=${partySize}`);
-          const slots = await resyClient.getAvailability(venueId, date, partySize);
-
-          if (slots.length === 0) {
-            return {
-              content: [{
-                type: 'text',
-                text: `No availability found for venue ${venueId} on ${date} for ${partySize} guests. The restaurant may be fully booked or not taking reservations for this date.`,
-              }],
-            };
-          }
-
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                platform: 'resy',
-                venueId,
-                restaurantId: `resy-${venueId}`,
-                date,
-                partySize,
-                slotCount: slots.length,
-                slots: slots.map(s => ({
-                  time: s.time,
-                  slotId: s.slotId,
-                  type: s.type,
-                })),
-                note: 'Use slotId with make_reservation to book.',
-              }, null, 2),
-            }],
-          };
-        }
-
-        case 'diagnostic_search': {
-          const query = (args as any).query;
-          const location = (args as any).location;
-          const date = parseDate((args as any).date);
-          const partySize = parsePartySize((args as any).partySize || (args as any).party_size);
-
-          logger.info('MCP', 'Starting diagnostic search', { query, location, date, partySize });
-
-          const result = await resyDiagnostic.diagnosticSearch(query, location, date, partySize);
-
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                ...result,
-                data: result.data?.slice(0, 20), // Limit results
-              }, null, 2),
-            }],
-          };
-        }
-
-        case 'run_diagnostic_tests': {
-          logger.info('MCP', 'Running diagnostic test suite');
-
-          const result = await resyDiagnostic.runDiagnosticTests();
-
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            }],
-          };
-        }
-
-        case 'get_known_venues': {
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                description: 'Known Resy venue IDs that can be used with get_venue_availability',
-                venues: Object.entries(KNOWN_VENUES).map(([key, v]) => ({
-                  key,
-                  venueId: v.id,
-                  name: v.name,
-                  city: v.city,
-                  usage: `get_venue_availability(venueId: ${v.id}, date: "YYYY-MM-DD")`,
-                })),
-              }, null, 2),
-            }],
-          };
-        }
-
-        case 'get_diagnostic_logs': {
-          const count = (args as any).count || 50;
-          const logs = logger.getRecentLogs(count);
-
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                logCount: logs.length,
-                logs,
-              }, null, 2),
-            }],
-          };
-        }
-
-        case 'get_rate_limit_status': {
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                resy: {
-                  ...resyDiagnostic.getRateLimitInfo(),
-                  requestCount: resyDiagnostic.getRequestCount(),
-                  authStatus: resyDiagnostic.getAuthStatus(),
-                },
-              }, null, 2),
-            }],
-          };
-        }
-
-        case 'lookup_venue_id': {
-          const url = (args as any).url;
-          const name = (args as any).name;
-          const city = (args as any).city;
-
-          let targetUrl: string;
-
-          if (url) {
-            targetUrl = url;
-          } else if (name && city) {
-            // Convert name to URL slug: "Don Angie" -> "don-angie"
-            const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-            targetUrl = `https://resy.com/cities/${city.toLowerCase()}/${slug}`;
-          } else {
-            return {
-              content: [{ type: 'text', text: 'Provide either url, or both name and city. Example: name: "Carbone", city: "ny"' }],
-              isError: true,
-            };
-          }
-
-          console.log(`[Resy] Looking up venue ID from: ${targetUrl}`);
-
-          try {
-            const response = await axios.get(targetUrl, {
-              headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-              },
-              timeout: 10000,
-            });
-
-            const html = response.data as string;
-
-            // Try multiple patterns to extract venue ID
-            let venueId: number | null = null;
-            let venueName: string | null = null;
-
-            // Pattern 1: Look for venue ID in JSON data
-            const jsonMatch = html.match(/"venue":\s*\{[^}]*"id":\s*\{[^}]*"resy":\s*(\d+)/);
-            if (jsonMatch) {
-              venueId = parseInt(jsonMatch[1], 10);
-            }
-
-            // Pattern 2: Look for data-venue-id attribute
-            if (!venueId) {
-              const attrMatch = html.match(/data-venue-id="(\d+)"/);
-              if (attrMatch) {
-                venueId = parseInt(attrMatch[1], 10);
-              }
-            }
-
-            // Pattern 3: Look for venue_id in script tags
-            if (!venueId) {
-              const scriptMatch = html.match(/venue_id['":\s]+(\d+)/);
-              if (scriptMatch) {
-                venueId = parseInt(scriptMatch[1], 10);
-              }
-            }
-
-            // Pattern 4: Look for "resy": followed by number
-            if (!venueId) {
-              const resyMatch = html.match(/"resy":\s*(\d+)/);
-              if (resyMatch) {
-                venueId = parseInt(resyMatch[1], 10);
-              }
-            }
-
-            // Try to extract venue name
-            const nameMatch = html.match(/<title>([^<|]+)/);
-            if (nameMatch) {
-              venueName = nameMatch[1].trim();
-            }
-
-            if (venueId) {
-              return {
-                content: [{
-                  type: 'text',
-                  text: JSON.stringify({
-                    success: true,
-                    venueId,
-                    restaurantId: `resy-${venueId}`,
-                    name: venueName,
-                    url: targetUrl,
-                    note: 'Use this venueId with get_venue_availability to check availability.',
-                  }, null, 2),
-                }],
-              };
-            } else {
-              return {
-                content: [{
-                  type: 'text',
-                  text: `Could not find venue ID at ${targetUrl}. The restaurant may not exist on Resy or the URL format may be different. Try the exact URL from resy.com.`,
-                }],
-              };
-            }
-          } catch (error) {
-            const status = (error as any).response?.status;
-            if (status === 404) {
-              return {
-                content: [{
-                  type: 'text',
-                  text: `Restaurant not found at ${targetUrl}. Check the URL or try a different name/city combination.`,
-                }],
-              };
-            }
-            return {
-              content: [{
-                type: 'text',
-                text: `Error fetching ${targetUrl}: ${error instanceof Error ? error.message : 'Unknown error'}`,
-              }],
-              isError: true,
-            };
-          }
-        }
-
-        default:
-          return {
-            content: [{ type: 'text', text: `Unknown tool: ${name}` }],
-            isError: true,
-          };
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
-    } catch (error) {
-      if (error instanceof z.ZodError) {
-        const issues = error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
+
+      case 'search_restaurant': {
+        const input = searchRestaurantSchema.parse(args);
+        const result = await searchRestaurant(
+          input.name,
+          input.location,
+          input.date,
+          input.party_size
+        );
+
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'get_restaurant': {
+        const input = getRestaurantSchema.parse(args);
+        const result = await getRestaurantById(input.restaurant_id);
+
+        if (result.error) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: result.error }, null, 2) }] };
+        }
+
+        if (!result.restaurant) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: 'Restaurant not found' }, null, 2) }] };
+        }
+
+        return { content: [{ type: 'text', text: JSON.stringify(result.restaurant, null, 2) }] };
+      }
+
+      case 'get_restaurants': {
+        const input = getRestaurantsSchema.parse(args);
+        const results = await getRestaurantsByIds(input.restaurant_ids);
+
+        const output = results.map((r) => ({
+          id: r.restaurant?.id,
+          name: r.restaurant?.name,
+          platform: r.platform,
+          found: r.restaurant !== null,
+          error: r.error,
+          details: r.restaurant,
+        }));
+
+        return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }] };
+      }
+
+      case 'check_availability': {
+        const input = checkAvailabilitySchema.parse(args);
+        const result = await checkAvailability(input.restaurant_id, input.date, input.party_size);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'make_reservation': {
+        const input = makeReservationSchema.parse(args);
+        const parsed = parseRestaurantId(input.restaurant_id);
+
+        if (!parsed) {
+          return { content: [{ type: 'text', text: `Invalid restaurant ID: ${input.restaurant_id}` }] };
+        }
+
+        const client = getPlatformClient(parsed.platform);
+        const params: ReservationParams = {
+          restaurantId: input.restaurant_id,
+          platform: parsed.platform,
+          slotId: input.slot_id,
+          date: input.date,
+          partySize: input.party_size,
+        };
+
+        const result = await client.makeReservation(params);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+
+      case 'get_booking_options': {
+        const input = getBookingOptionsSchema.parse(args);
+        const options = await getBookingOptions(input.restaurant_id);
+        return { content: [{ type: 'text', text: JSON.stringify(options, null, 2) }] };
+      }
+
+      case 'list_reservations': {
+        const input = listReservationsSchema.parse(args);
+        const results: Array<{
+          platform: string;
+          reservationId: string;
+          restaurantName: string;
+          location: string;
+          date: string;
+          time: string;
+          partySize: number;
+          status: string;
+        }> = [];
+
+        if (input.platform === 'resy' || input.platform === 'all') {
+          try {
+            const resyReservations = await resyClient.getReservations();
+            for (const r of resyReservations) {
+              results.push({
+                platform: 'resy',
+                reservationId: r.reservationId,
+                restaurantName: r.venue.name,
+                location: r.venue.location,
+                date: r.date,
+                time: r.time,
+                partySize: r.partySize,
+                status: r.status,
+              });
+            }
+          } catch {
+            // Skip if not authenticated
+          }
+        }
+
+        return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+      }
+
+      case 'cancel_reservation': {
+        const input = cancelReservationSchema.parse(args);
+
+        if (input.platform === 'resy') {
+          try {
+            await resyClient.cancelReservation(input.reservation_id);
+            return { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Reservation cancelled successfully' }, null, 2) }] };
+          } catch (error) {
+            return { content: [{ type: 'text', text: JSON.stringify({ success: false, message: error instanceof Error ? error.message : 'Failed to cancel' }, null, 2) }] };
+          }
+        } else {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, message: `${input.platform} reservations must be cancelled on their website` }, null, 2) }] };
+        }
+      }
+
+      case 'set_credentials': {
+        const input = setCredentialsSchema.parse(args);
+        const stored: string[] = [];
+
+        if (input.platform === 'resy') {
+          if (input.api_key) {
+            await setCredential('resy-api-key', input.api_key);
+            stored.push('API key');
+          }
+          if (input.auth_token) {
+            await setCredential('resy-auth-token', input.auth_token);
+            stored.push('auth token');
+          }
+        } else {
+          if (input.auth_token) {
+            await setCredential('opentable-token', input.auth_token);
+            stored.push('auth token');
+          }
+        }
+
         return {
-          content: [{ type: 'text', text: `Invalid input: ${issues}` }],
-          isError: true,
+          content: [{
+            type: 'text',
+            text: stored.length > 0
+              ? `Stored ${stored.join(' and ')} for ${input.platform}.`
+              : 'No credentials provided to store.',
+          }],
         };
       }
+
+      case 'set_login': {
+        const input = setLoginSchema.parse(args);
+
+        if (input.platform === 'resy') {
+          try {
+            await resyClient.login(input.email, input.password);
+            return {
+              content: [{
+                type: 'text',
+                text: 'Login successful! Credentials stored securely. Token will auto-refresh when needed.',
+              }],
+            };
+          } catch (error) {
+            return {
+              content: [{
+                type: 'text',
+                text: `Login failed: ${error instanceof Error ? error.message : 'Invalid credentials'}`,
+              }],
+            };
+          }
+        }
+
+        return { content: [{ type: 'text', text: 'Only Resy login is currently supported.' }] };
+      }
+
+      case 'check_auth_status': {
+        const input = checkAuthStatusSchema.parse(args);
+        const statuses: Record<string, unknown>[] = [];
+
+        if (input.platform === 'resy' || input.platform === 'all') {
+          const status = await getResyAuthStatus();
+          const isValid = status.hasAuthToken ? await resyClient.isAuthenticated() : false;
+          statuses.push({ ...status, isValid });
+        }
+
+        if (input.platform === 'opentable' || input.platform === 'all') {
+          const status = await getOpenTableAuthStatus();
+          statuses.push({ ...status, isValid: true });
+        }
+
+        if (input.platform === 'tock' || input.platform === 'all') {
+          statuses.push({
+            platform: 'tock',
+            hasApiKey: false,
+            hasAuthToken: false,
+            hasLogin: false,
+            isValid: true, // Tock works without auth
+          });
+        }
+
+        return { content: [{ type: 'text', text: JSON.stringify(statuses, null, 2) }] };
+      }
+
+      case 'refresh_token': {
+        const input = refreshTokenSchema.parse(args);
+
+        if (input.platform === 'resy') {
+          const email = await getCredential('resy-email');
+          const password = await getCredential('resy-password');
+
+          if (!email || !password) {
+            return {
+              content: [{
+                type: 'text',
+                text: 'No login credentials stored. Use set_login first.',
+              }],
+            };
+          }
+
+          try {
+            await resyClient.login(email, password);
+            return { content: [{ type: 'text', text: 'Token refreshed successfully!' }] };
+          } catch (error) {
+            return {
+              content: [{
+                type: 'text',
+                text: `Token refresh failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+              }],
+            };
+          }
+        }
+
+        return { content: [{ type: 'text', text: 'Only Resy token refresh is supported.' }] };
+      }
+
+      case 'snipe_reservation': {
+        const input = snipeReservationSchema.parse(args);
+        const result = await snipeReservation(input);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'list_snipes': {
+        const input = listSnipesSchema.parse(args);
+        const results = await listScheduledSnipes(input);
+        return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+      }
+
+      case 'cancel_snipe': {
+        const input = cancelSnipeSchema.parse(args);
+        const result = await cancelSnipe(input);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'get_platform_status': {
+        const health = await getPlatformHealth();
+        const rateLimits = rateLimiter.getAllStatus();
+        const cacheStats = cache.stats();
+
+        const status = {
+          platforms: Object.entries(health).map(([platform, available]) => ({
+            platform,
+            available,
+            rateLimit: rateLimits.find((r) => r.platform === platform),
+          })),
+          cache: cacheStats,
+        };
+
+        return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
+      }
+
+      default:
+        return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
+    }
+  } catch (error) {
+    if (error instanceof z.ZodError) {
       return {
-        content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : 'Unknown'}` }],
-        isError: true,
+        content: [{
+          type: 'text',
+          text: `Invalid input: ${error.errors.map((e) => `${e.path.join('.')}: ${e.message}`).join(', ')}`,
+        }],
       };
     }
+    return {
+      content: [{
+        type: 'text',
+        text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      }],
+    };
+  }
+});
+
+// Start server
+async function main() {
+  // Start the snipe scheduler
+  await startScheduler();
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+
+  // Cleanup on exit
+  process.on('SIGINT', () => {
+    cache.destroy();
+    stopScheduler();
+    process.exit(0);
   });
 
-  return server;
+  process.on('SIGTERM', () => {
+    cache.destroy();
+    stopScheduler();
+    process.exit(0);
+  });
 }
 
-// Session management
-const sessions = new Map<string, { server: Server; transport: StreamableHTTPServerTransport }>();
-
-app.use((_req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id');
-  next();
+main().catch((error) => {
+  console.error('Failed to start server:', error);
+  process.exit(1);
 });
-
-app.options('*', (_req, res) => res.status(200).end());
-
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-app.all('/mcp', express.json(), async (req, res) => {
-  if (req.method === 'GET') {
-    const sessionId = req.headers['mcp-session-id'] as string;
-    if (!sessionId || !sessions.has(sessionId)) {
-      res.status(400).json({ error: 'Invalid session' });
-      return;
-    }
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.flushHeaders();
-    return;
-  }
-
-  if (req.method === 'DELETE') {
-    const sessionId = req.headers['mcp-session-id'] as string;
-    if (sessionId && sessions.has(sessionId)) {
-      await sessions.get(sessionId)!.server.close();
-      sessions.delete(sessionId);
-    }
-    res.status(200).json({ success: true });
-    return;
-  }
-
-  if (req.method === 'POST') {
-    let sessionId = req.headers['mcp-session-id'] as string;
-    if (!sessionId || !sessions.has(sessionId)) {
-      sessionId = randomUUID();
-      const server = createServer();
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId });
-      sessions.set(sessionId, { server, transport });
-      await server.connect(transport);
-    }
-    try {
-      await sessions.get(sessionId)!.transport.handleRequest(req, res, req.body);
-    } catch (err) {
-      if (!res.headersSent) res.status(500).json({ error: 'Internal error' });
-    }
-    return;
-  }
-
-  res.status(405).json({ error: 'Method not allowed' });
-});
-
-async function main() {
-  console.log('[MCP] Starting Restaurant Reservation Server...');
-  try {
-    await resyClient.ensureAuth();
-    console.log('[MCP] Resy auth successful');
-  } catch (e) {
-    console.warn('[MCP] Resy auth failed:', e instanceof Error ? e.message : e);
-  }
-  app.listen(PORT, () => console.log(`[MCP] Listening on port ${PORT}`));
-}
-
-main().catch(console.error);
