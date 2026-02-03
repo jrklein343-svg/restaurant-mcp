@@ -1,5 +1,5 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -8,12 +8,10 @@ import express from 'express';
 import { z } from 'zod';
 import { resyClient } from './resy-client.js';
 import { openTableClient } from './opentable-client.js';
+import { randomUUID } from 'crypto';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
-
-// Store active transports for cleanup
-const transports = new Map<string, SSEServerTransport>();
 
 // Tool schemas
 const searchSchema = z.object({
@@ -276,11 +274,14 @@ function createServer(): Server {
   return server;
 }
 
+// Store active sessions
+const sessions = new Map<string, { server: Server; transport: StreamableHTTPServerTransport }>();
+
 // Enable CORS for all routes
 app.use((_req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id');
   next();
 });
 
@@ -293,64 +294,82 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// SSE endpoint for MCP - Poke connects here
-app.get('/sse', async (req, res) => {
-  console.log('[MCP] New SSE connection from:', req.ip);
+// MCP endpoint - Streamable HTTP transport
+app.all('/mcp', express.json(), async (req, res) => {
+  console.log(`[MCP] ${req.method} /mcp from:`, req.ip);
 
-  // Let the SDK handle SSE setup - just create transport with response
-  const transport = new SSEServerTransport('/message', res);
+  // Handle GET for SSE stream (session notifications)
+  if (req.method === 'GET') {
+    const sessionId = req.headers['mcp-session-id'] as string;
+    console.log('[MCP] GET request, session:', sessionId);
 
-  // Generate session ID and store transport
-  const sessionId = Math.random().toString(36).substring(2, 15);
-  transports.set(sessionId, transport);
+    if (!sessionId || !sessions.has(sessionId)) {
+      res.status(400).json({ error: 'Invalid or missing session ID' });
+      return;
+    }
 
-  console.log('[MCP] Session created:', sessionId);
+    // Set up SSE for notifications
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
 
-  const server = createServer();
-
-  res.on('close', () => {
-    console.log('[MCP] SSE connection closed:', sessionId);
-    transports.delete(sessionId);
-    server.close();
-  });
-
-  try {
-    await server.connect(transport);
-    console.log('[MCP] Server connected to transport successfully');
-  } catch (err) {
-    console.error('[MCP] Failed to connect:', err);
-    res.end();
-  }
-});
-
-// Message endpoint for MCP - clients POST messages here
-app.post('/message', express.json(), async (req, res) => {
-  const sessionId = req.query.sessionId as string;
-  console.log('[MCP] Message received, looking for sessionId:', sessionId);
-  console.log('[MCP] Available sessions:', [...transports.keys()]);
-
-  // Try to find matching transport
-  let transport = transports.get(sessionId);
-
-  // If no exact match, try to find any active transport (for single-session scenarios)
-  if (!transport && transports.size === 1) {
-    transport = transports.values().next().value;
-    console.log('[MCP] Using single available transport');
+    req.on('close', () => {
+      console.log('[MCP] SSE connection closed for session:', sessionId);
+    });
+    return;
   }
 
-  if (transport) {
+  // Handle DELETE for session termination
+  if (req.method === 'DELETE') {
+    const sessionId = req.headers['mcp-session-id'] as string;
+    console.log('[MCP] DELETE session:', sessionId);
+
+    if (sessionId && sessions.has(sessionId)) {
+      const session = sessions.get(sessionId)!;
+      await session.server.close();
+      sessions.delete(sessionId);
+    }
+    res.status(200).json({ success: true });
+    return;
+  }
+
+  // Handle POST for messages
+  if (req.method === 'POST') {
+    let sessionId = req.headers['mcp-session-id'] as string;
+    console.log('[MCP] POST request, session:', sessionId, 'body:', JSON.stringify(req.body));
+
+    // Create new session if needed (for initialize request)
+    if (!sessionId || !sessions.has(sessionId)) {
+      sessionId = randomUUID();
+      console.log('[MCP] Creating new session:', sessionId);
+
+      const server = createServer();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => sessionId,
+      });
+
+      sessions.set(sessionId, { server, transport });
+
+      await server.connect(transport);
+      console.log('[MCP] Server connected to transport');
+    }
+
+    const session = sessions.get(sessionId)!;
+
     try {
-      await transport.handlePostMessage(req, res);
+      // Handle the request through the transport
+      await session.transport.handleRequest(req, res, req.body);
     } catch (err) {
-      console.error('[MCP] Error handling message:', err);
+      console.error('[MCP] Error handling request:', err);
       if (!res.headersSent) {
-        res.status(500).json({ error: 'Internal error' });
+        res.status(500).json({ error: 'Internal error', message: err instanceof Error ? err.message : 'Unknown' });
       }
     }
-  } else {
-    console.log('[MCP] No transport found');
-    res.status(400).json({ error: 'No active session', available: [...transports.keys()] });
+    return;
   }
+
+  res.status(405).json({ error: 'Method not allowed' });
 });
 
 async function main() {
@@ -366,7 +385,7 @@ async function main() {
 
   app.listen(PORT, () => {
     console.log(`[MCP Server] Listening on port ${PORT}`);
-    console.log('[MCP Server] MCP SSE endpoint: /sse');
+    console.log('[MCP Server] MCP endpoint: /mcp');
     console.log('[MCP Server] Health check: /health');
   });
 }
