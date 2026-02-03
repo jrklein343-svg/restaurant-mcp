@@ -178,6 +178,30 @@ The slotId comes from check_availability results.`,
         description: 'Check if Resy authentication is working. No parameters needed.',
         inputSchema: { type: 'object', properties: {} },
       },
+      {
+        name: 'get_venue_availability',
+        description: `Get availability for a known Resy venue ID directly (bypasses search).
+
+EXAMPLES:
+- get_venue_availability(venueId: 1505, date: "2026-02-15", partySize: 2)  // Carbone NYC
+- get_venue_availability(venueId: 25973, date: "2026-02-15", partySize: 4) // 4 Charles Prime Rib
+
+Common NYC venue IDs:
+- Carbone: 1505
+- Don Angie: 5765
+- Via Carota: 2567
+- 4 Charles Prime Rib: 25973
+- Le Coucou: 3013`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            venueId: { type: 'number', description: 'Resy venue ID (numeric)' },
+            date: { type: 'string', description: 'Date (YYYY-MM-DD)' },
+            partySize: { type: ['string', 'number'], description: 'Number of guests (defaults to 2)' },
+          },
+          required: ['venueId', 'date'],
+        },
+      },
     ],
   }));
 
@@ -430,6 +454,51 @@ The slotId comes from check_availability results.`,
               isError: true,
             };
           }
+        }
+
+        case 'get_venue_availability': {
+          const venueId = (args as any).venueId || (args as any).venue_id;
+          const date = parseDate((args as any).date);
+          const partySize = parsePartySize((args as any).partySize || (args as any).party_size);
+
+          if (!venueId || typeof venueId !== 'number') {
+            return {
+              content: [{ type: 'text', text: 'venueId (number) is required. Example: venueId: 1505 for Carbone NYC' }],
+              isError: true,
+            };
+          }
+
+          console.log(`[Resy] Direct venue lookup: venueId=${venueId}, date=${date}, partySize=${partySize}`);
+          const slots = await resyClient.getAvailability(venueId, date, partySize);
+
+          if (slots.length === 0) {
+            return {
+              content: [{
+                type: 'text',
+                text: `No availability found for venue ${venueId} on ${date} for ${partySize} guests. The restaurant may be fully booked or not taking reservations for this date.`,
+              }],
+            };
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                platform: 'resy',
+                venueId,
+                restaurantId: `resy-${venueId}`,
+                date,
+                partySize,
+                slotCount: slots.length,
+                slots: slots.map(s => ({
+                  time: s.time,
+                  slotId: s.slotId,
+                  type: s.type,
+                })),
+                note: 'Use slotId with make_reservation to book.',
+              }, null, 2),
+            }],
+          };
         }
 
         default:
