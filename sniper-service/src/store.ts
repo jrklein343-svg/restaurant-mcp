@@ -15,7 +15,8 @@ export interface Snipe {
   result?: string;
 }
 
-const DATA_DIR = process.env.DATA_DIR || './data';
+// Use /tmp for free tier (ephemeral) or DATA_DIR for paid tier with disk
+const DATA_DIR = process.env.DATA_DIR || '/tmp/sniper-data';
 const DB_PATH = join(DATA_DIR, 'snipes.db');
 
 let db: Database | null = null;
