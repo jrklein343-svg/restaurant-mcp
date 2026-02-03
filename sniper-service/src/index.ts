@@ -479,7 +479,7 @@ app.all('/mcp', express.json(), async (req, res) => {
 });
 
 async function main() {
-  console.log('[MCP Sniper] Starting Restaurant Sniper MCP Server...');
+  console.log('[MCP Sniper] Starting Restaurant Sniper MCP Server v1.1...');
 
   try {
     await resyClient.ensureAuth();
