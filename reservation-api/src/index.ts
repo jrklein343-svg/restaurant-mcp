@@ -8,6 +8,8 @@ import express from 'express';
 import { z } from 'zod';
 import { resyClient } from './resy-client.js';
 import { openTableClient } from './opentable-client.js';
+import { resyDiagnostic, KNOWN_VENUES } from './resy-diagnostic.js';
+import { logger } from './logger.js';
 import { randomUUID } from 'crypto';
 import axios from 'axios';
 
@@ -221,6 +223,55 @@ City codes: ny, la, sf, chi, mia, dc, las-vegas, austin, denver, seattle, boston
             city: { type: 'string', description: 'City code: ny, la, sf, chi, mia, dc, etc.' },
           },
         },
+      },
+      {
+        name: 'diagnostic_search',
+        description: `DIAGNOSTIC: Search with verbose logging and multiple strategies.
+Tries: known venue lookup, geolocation search, basic search, fuzzy variations.
+Returns detailed attempt logs showing what worked and what failed.
+
+EXAMPLES:
+- diagnostic_search(query: "Juliet", location: "Culver City")
+- diagnostic_search(query: "Carbone", location: "New York")`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Restaurant name' },
+            location: { type: 'string', description: 'City or neighborhood' },
+            date: { type: 'string', description: 'Date (YYYY-MM-DD), defaults to today' },
+            partySize: { type: 'number', description: 'Number of guests (defaults to 2)' },
+          },
+          required: ['query', 'location'],
+        },
+      },
+      {
+        name: 'run_diagnostic_tests',
+        description: `DIAGNOSTIC: Run test suite against known restaurants.
+Tests Juliet (Culver City), Margot (Culver City), Carbone (NYC), Bestia (LA).
+Compares direct ID lookup vs search methods.`,
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        name: 'get_known_venues',
+        description: `List all known Resy venue IDs that can be used directly.
+Includes venues in NYC, LA, and Culver City.`,
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        name: 'get_diagnostic_logs',
+        description: `Get recent diagnostic logs for debugging.
+Shows raw API requests, responses, and errors.`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            count: { type: 'number', description: 'Number of log entries (default 50)' },
+          },
+        },
+      },
+      {
+        name: 'get_rate_limit_status',
+        description: `Check current rate limit status and request counts.`,
+        inputSchema: { type: 'object', properties: {} },
       },
     ],
   }));
@@ -516,6 +567,88 @@ City codes: ny, la, sf, chi, mia, dc, las-vegas, austin, denver, seattle, boston
                   type: s.type,
                 })),
                 note: 'Use slotId with make_reservation to book.',
+              }, null, 2),
+            }],
+          };
+        }
+
+        case 'diagnostic_search': {
+          const query = (args as any).query;
+          const location = (args as any).location;
+          const date = parseDate((args as any).date);
+          const partySize = parsePartySize((args as any).partySize || (args as any).party_size);
+
+          logger.info('MCP', 'Starting diagnostic search', { query, location, date, partySize });
+
+          const result = await resyDiagnostic.diagnosticSearch(query, location, date, partySize);
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                ...result,
+                data: result.data?.slice(0, 20), // Limit results
+              }, null, 2),
+            }],
+          };
+        }
+
+        case 'run_diagnostic_tests': {
+          logger.info('MCP', 'Running diagnostic test suite');
+
+          const result = await resyDiagnostic.runDiagnosticTests();
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            }],
+          };
+        }
+
+        case 'get_known_venues': {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                description: 'Known Resy venue IDs that can be used with get_venue_availability',
+                venues: Object.entries(KNOWN_VENUES).map(([key, v]) => ({
+                  key,
+                  venueId: v.id,
+                  name: v.name,
+                  city: v.city,
+                  usage: `get_venue_availability(venueId: ${v.id}, date: "YYYY-MM-DD")`,
+                })),
+              }, null, 2),
+            }],
+          };
+        }
+
+        case 'get_diagnostic_logs': {
+          const count = (args as any).count || 50;
+          const logs = logger.getRecentLogs(count);
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                logCount: logs.length,
+                logs,
+              }, null, 2),
+            }],
+          };
+        }
+
+        case 'get_rate_limit_status': {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                resy: {
+                  ...resyDiagnostic.getRateLimitInfo(),
+                  requestCount: resyDiagnostic.getRequestCount(),
+                  authStatus: resyDiagnostic.getAuthStatus(),
+                },
               }, null, 2),
             }],
           };
