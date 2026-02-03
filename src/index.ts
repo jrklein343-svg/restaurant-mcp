@@ -690,8 +690,8 @@ async function main() {
       return;
     }
 
-    // SSE endpoint - establishes connection
-    if (url.pathname === '/sse' && req.method === 'GET') {
+    // SSE endpoint - establishes connection (supports both /sse and /mcp)
+    if ((url.pathname === '/sse' || url.pathname === '/mcp') && req.method === 'GET') {
       console.log('New SSE connection');
 
       const sessionId = crypto.randomUUID();
