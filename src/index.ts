@@ -17,8 +17,10 @@ import { openTableClient } from './platforms/opentable.js';
 import { tockClient } from './platforms/tock.js';
 import { parseRestaurantId } from './platforms/base.js';
 import {
-  searchRestaurants,
-  findRestaurantByName,
+  findTable,
+  searchRestaurant,
+  getRestaurantById,
+  getRestaurantsByIds,
   getRestaurantDetails,
   checkAvailability,
   getBookingOptions,
@@ -40,23 +42,28 @@ import {
 import { startScheduler, stopScheduler } from './sniper/scheduler.js';
 
 // Schemas for tool inputs
-const searchRestaurantsSchema = z.object({
-  query: z.string().min(1).max(100).describe('Restaurant name or search term'),
-  location: z.string().min(1).max(100).describe('City, neighborhood, or address'),
-  cuisine: z.string().optional().describe('Type of cuisine to filter by'),
-  date: z.string().optional().describe('Check availability for date (YYYY-MM-DD)'),
+const findTableSchema = z.object({
+  restaurant: z.string().min(1).max(100).describe('Restaurant name'),
+  location: z.string().min(1).max(100).describe('City or neighborhood'),
+  date: z.string().describe('Date (YYYY-MM-DD) or relative like "friday", "tomorrow"'),
+  time: z.string().describe('Preferred time like "noon", "7pm", "around 8"'),
   party_size: z.number().int().min(1).max(20).default(2).describe('Number of guests'),
-  price_range: z.array(z.number().int().min(1).max(4)).optional().describe('Filter by price (1-4, $ to $$$$)'),
-  platforms: z.array(z.enum(['resy', 'opentable', 'tock'])).optional().describe('Limit to specific platforms'),
-  fuzzy_match: z.boolean().default(true).describe('Enable fuzzy name matching for typos'),
+  book: z.boolean().default(true).describe('Automatically book the best available slot'),
 });
 
-const getRestaurantDetailsSchema = z.object({
-  restaurant_id: z.string().optional().describe('Direct restaurant ID (e.g., resy-12345)'),
-  name: z.string().optional().describe('Restaurant name for fuzzy search'),
-  location: z.string().optional().describe('Location (required if using name)'),
-  include_menu: z.boolean().default(false).describe('Include menu information'),
-  include_hours: z.boolean().default(true).describe('Include operating hours'),
+const searchRestaurantSchema = z.object({
+  name: z.string().min(1).max(100).describe('Restaurant name to search for'),
+  location: z.string().min(1).max(100).describe('City or neighborhood'),
+  date: z.string().optional().describe('Optional date for availability context (YYYY-MM-DD)'),
+  party_size: z.number().int().min(1).max(20).default(2).describe('Party size'),
+});
+
+const getRestaurantSchema = z.object({
+  restaurant_id: z.string().min(1).describe('Restaurant ID in format "platform-id" (e.g., resy-12345, opentable-67890, tock-venue-slug)'),
+});
+
+const getRestaurantsSchema = z.object({
+  restaurant_ids: z.array(z.string()).min(1).max(20).describe('Array of restaurant IDs to look up'),
 });
 
 const checkAvailabilitySchema = z.object({
@@ -72,11 +79,6 @@ const makeReservationSchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('Reservation date (YYYY-MM-DD)'),
 });
 
-const findRestaurantByNameSchema = z.object({
-  name: z.string().min(1).max(100).describe('Restaurant name (supports typos and variations)'),
-  location: z.string().min(1).max(100).describe('City or neighborhood'),
-  platforms: z.array(z.enum(['resy', 'opentable', 'tock'])).optional().describe('Platforms to search'),
-});
 
 const getBookingOptionsSchema = z.object({
   restaurant_id: z.string().min(1).describe('Restaurant ID'),
@@ -127,35 +129,55 @@ const server = new Server(
 // Tool definitions
 const tools = [
   {
-    name: 'search_restaurants',
-    description: 'Search for restaurants across Resy, OpenTable, and Tock. Supports fuzzy matching for typos (e.g., "carbonne" finds "Carbone"). Returns unified results with ratings, cuisine, price range, and which platforms each restaurant is available on.',
+    name: 'find_table',
+    description: 'Find and book a table at a restaurant. Searches by name, checks availability for your date/time/party size, and books the best matching slot. Returns confirmation or booking URL.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        query: { type: 'string', description: 'Restaurant name or search term' },
-        location: { type: 'string', description: 'City, neighborhood, or address' },
-        cuisine: { type: 'string', description: 'Type of cuisine to filter by' },
-        date: { type: 'string', description: 'Check availability for date (YYYY-MM-DD)' },
+        restaurant: { type: 'string', description: 'Restaurant name (e.g., "Carbone", "The Grill")' },
+        location: { type: 'string', description: 'City or neighborhood (e.g., "New York", "Manhattan")' },
+        date: { type: 'string', description: 'Date - YYYY-MM-DD or relative like "friday", "tomorrow"' },
+        time: { type: 'string', description: 'Preferred time like "noon", "7pm", "around 8"' },
         party_size: { type: 'number', default: 2, description: 'Number of guests' },
-        price_range: { type: 'array', items: { type: 'number' }, description: 'Filter by price (1-4)' },
-        platforms: { type: 'array', items: { type: 'string', enum: ['resy', 'opentable', 'tock'] }, description: 'Limit to specific platforms' },
-        fuzzy_match: { type: 'boolean', default: true, description: 'Enable fuzzy matching for typos' },
+        book: { type: 'boolean', default: true, description: 'Auto-book best slot (true) or just show options (false)' },
       },
-      required: ['query', 'location'],
+      required: ['restaurant', 'location', 'date', 'time', 'party_size'],
     },
   },
   {
-    name: 'get_restaurant_details',
-    description: 'Get comprehensive details about a restaurant including hours, contact info, menu highlights, and all booking options.',
+    name: 'search_restaurant',
+    description: 'Search for a restaurant by name and location. Returns matching restaurants with their IDs.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        restaurant_id: { type: 'string', description: 'Direct restaurant ID (e.g., resy-12345)' },
-        name: { type: 'string', description: 'Restaurant name for fuzzy search' },
-        location: { type: 'string', description: 'Location (required if using name)' },
-        include_menu: { type: 'boolean', default: false, description: 'Include menu info' },
-        include_hours: { type: 'boolean', default: true, description: 'Include operating hours' },
+        name: { type: 'string', description: 'Restaurant name to search for' },
+        location: { type: 'string', description: 'City or neighborhood' },
+        date: { type: 'string', description: 'Optional date for context (YYYY-MM-DD)' },
+        party_size: { type: 'number', default: 2, description: 'Party size' },
       },
+      required: ['name', 'location'],
+    },
+  },
+  {
+    name: 'get_restaurant',
+    description: 'Look up a restaurant by its platform-specific ID. Returns full details including name, address, cuisine, hours, contact info, and booking options.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        restaurant_id: { type: 'string', description: 'Restaurant ID (e.g., resy-12345, opentable-67890, tock-venue-slug)' },
+      },
+      required: ['restaurant_id'],
+    },
+  },
+  {
+    name: 'get_restaurants',
+    description: 'Look up multiple restaurants by their IDs in a single call.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        restaurant_ids: { type: 'array', items: { type: 'string' }, description: 'Array of restaurant IDs to look up' },
+      },
+      required: ['restaurant_ids'],
     },
   },
   {
@@ -183,19 +205,6 @@ const tools = [
         date: { type: 'string', description: 'Reservation date (YYYY-MM-DD)' },
       },
       required: ['restaurant_id', 'slot_id', 'party_size', 'date'],
-    },
-  },
-  {
-    name: 'find_restaurant_by_name',
-    description: 'Find a restaurant by name with fuzzy matching. Handles typos, variations, and different naming conventions across platforms.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        name: { type: 'string', description: 'Restaurant name (typos OK)' },
-        location: { type: 'string', description: 'City or neighborhood' },
-        platforms: { type: 'array', items: { type: 'string', enum: ['resy', 'opentable', 'tock'] }, description: 'Platforms to search' },
-      },
-      required: ['name', 'location'],
     },
   },
   {
@@ -334,61 +343,61 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
-      case 'search_restaurants': {
-        const input = searchRestaurantsSchema.parse(args);
-        const results = await searchRestaurants({
-          query: input.query,
-          location: input.location,
-          cuisine: input.cuisine,
-          date: input.date,
-          partySize: input.party_size,
-          priceRange: input.price_range as (1 | 2 | 3 | 4)[] | undefined,
-          platforms: input.platforms as PlatformName[] | undefined,
-          fuzzyMatch: input.fuzzy_match,
-        });
+      case 'find_table': {
+        const input = findTableSchema.parse(args);
+        const result = await findTable(
+          input.restaurant,
+          input.location,
+          input.date,
+          input.time,
+          input.party_size,
+          input.book
+        );
 
-        // Format for output
-        const output = {
-          results: results.restaurants.map((r) => ({
-            id: r.id,
-            name: r.name,
-            location: r.location,
-            neighborhood: r.neighborhood,
-            cuisine: r.cuisine,
-            priceRange: r.priceRange,
-            rating: r.rating,
-            reviewCount: r.reviewCount,
-            platforms: r.platforms,
-            imageUrl: r.imageUrl,
-            matchConfidence: r.matchConfidence,
-          })),
-          totalResults: results.totalResults,
-          platformsSearched: results.platformsSearched,
-          cached: results.cached,
-          ...(Object.keys(results.platformErrors).length > 0 && { platformErrors: results.platformErrors }),
-        };
-
-        return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
-      case 'get_restaurant_details': {
-        const input = getRestaurantDetailsSchema.parse(args);
+      case 'search_restaurant': {
+        const input = searchRestaurantSchema.parse(args);
+        const result = await searchRestaurant(
+          input.name,
+          input.location,
+          input.date,
+          input.party_size
+        );
 
-        if (!input.restaurant_id && !input.name) {
-          return { content: [{ type: 'text', text: 'Either restaurant_id or name is required' }] };
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'get_restaurant': {
+        const input = getRestaurantSchema.parse(args);
+        const result = await getRestaurantById(input.restaurant_id);
+
+        if (result.error) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: result.error }, null, 2) }] };
         }
 
-        if (input.name && !input.location) {
-          return { content: [{ type: 'text', text: 'Location is required when searching by name' }] };
+        if (!result.restaurant) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: 'Restaurant not found' }, null, 2) }] };
         }
 
-        const details = await getRestaurantDetails(input.restaurant_id, input.name, input.location);
+        return { content: [{ type: 'text', text: JSON.stringify(result.restaurant, null, 2) }] };
+      }
 
-        if (!details) {
-          return { content: [{ type: 'text', text: 'Restaurant not found. Try searching with different terms.' }] };
-        }
+      case 'get_restaurants': {
+        const input = getRestaurantsSchema.parse(args);
+        const results = await getRestaurantsByIds(input.restaurant_ids);
 
-        return { content: [{ type: 'text', text: JSON.stringify(details, null, 2) }] };
+        const output = results.map((r) => ({
+          id: r.restaurant?.id,
+          name: r.restaurant?.name,
+          platform: r.platform,
+          found: r.restaurant !== null,
+          error: r.error,
+          details: r.restaurant,
+        }));
+
+        return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }] };
       }
 
       case 'check_availability': {
@@ -418,28 +427,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
-      case 'find_restaurant_by_name': {
-        const input = findRestaurantByNameSchema.parse(args);
-        const result = await findRestaurantByName(
-          input.name,
-          input.location,
-          input.platforms as PlatformName[] | undefined
-        );
-
-        const output = {
-          results: result.results.map((r) => ({
-            id: r.id,
-            name: r.name,
-            location: r.location,
-            platform: r.platform,
-            rating: r.rating,
-            matchScore: r.matchScore,
-          })),
-          suggestions: result.suggestions,
-        };
-
-        return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }] };
-      }
 
       case 'get_booking_options': {
         const input = getBookingOptionsSchema.parse(args);
