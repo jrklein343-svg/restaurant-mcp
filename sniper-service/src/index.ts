@@ -263,6 +263,18 @@ function createServer(): Server {
   return server;
 }
 
+// Enable CORS for all routes
+app.use((_req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  next();
+});
+
+app.options('*', (_req, res) => {
+  res.status(200).end();
+});
+
 // Health check
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -272,16 +284,11 @@ app.get('/health', (_req, res) => {
 app.get('/sse', async (req, res) => {
   console.log('[MCP] New SSE connection from:', req.ip);
 
-  // Set up SSE headers
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.flushHeaders();
-
-  // Create transport - the path is where clients POST messages back
+  // Let the SDK handle SSE setup - just create transport with response
   const transport = new SSEServerTransport('/message', res);
-  const sessionId = transport.sessionId;
+
+  // Generate session ID and store transport
+  const sessionId = Math.random().toString(36).substring(2, 15);
   transports.set(sessionId, transport);
 
   console.log('[MCP] Session created:', sessionId);
@@ -291,33 +298,45 @@ app.get('/sse', async (req, res) => {
   res.on('close', () => {
     console.log('[MCP] SSE connection closed:', sessionId);
     transports.delete(sessionId);
+    server.close();
   });
 
   try {
     await server.connect(transport);
-    console.log('[MCP] Server connected to transport');
+    console.log('[MCP] Server connected to transport successfully');
   } catch (err) {
     console.error('[MCP] Failed to connect:', err);
+    res.end();
   }
 });
 
 // Message endpoint for MCP - clients POST messages here
 app.post('/message', express.json(), async (req, res) => {
-  console.log('[MCP] Message received, sessionId:', req.query.sessionId);
-
   const sessionId = req.query.sessionId as string;
-  const transport = transports.get(sessionId);
+  console.log('[MCP] Message received, looking for sessionId:', sessionId);
+  console.log('[MCP] Available sessions:', [...transports.keys()]);
+
+  // Try to find matching transport - the SDK sends sessionId in query
+  let transport = transports.get(sessionId);
+
+  // If no exact match, try to find any active transport (for single-session scenarios)
+  if (!transport && transports.size === 1) {
+    transport = transports.values().next().value;
+    console.log('[MCP] Using single available transport');
+  }
 
   if (transport) {
     try {
       await transport.handlePostMessage(req, res);
     } catch (err) {
       console.error('[MCP] Error handling message:', err);
-      res.status(500).json({ error: 'Internal error' });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Internal error' });
+      }
     }
   } else {
-    console.log('[MCP] No transport for session:', sessionId, 'Available:', [...transports.keys()]);
-    res.status(400).json({ error: 'No active session' });
+    console.log('[MCP] No transport found');
+    res.status(400).json({ error: 'No active session', available: [...transports.keys()] });
   }
 });
 
