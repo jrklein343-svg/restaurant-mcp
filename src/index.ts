@@ -5,6 +5,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import http from 'http';
+import crypto from 'crypto';
 import { z } from 'zod';
 
 import {
@@ -664,15 +665,17 @@ async function main() {
   // Start the snipe scheduler
   await startScheduler();
 
-  // Track active transports
+  // Track active transports by session ID
   const transports = new Map<string, SSEServerTransport>();
 
   // Create HTTP server for SSE
   const httpServer = http.createServer(async (req, res) => {
+    const url = new URL(req.url || '/', `http://${req.headers.host}`);
+
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -681,42 +684,59 @@ async function main() {
     }
 
     // Health check
-    if (req.url === '/health' || req.url === '/') {
+    if (url.pathname === '/health' || url.pathname === '/') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', service: 'restaurant-mcp' }));
+      res.end(JSON.stringify({ status: 'ok', service: 'restaurant-mcp', version: '2.0.0' }));
       return;
     }
 
-    // SSE endpoint
-    if (req.url === '/sse' && req.method === 'GET') {
-      const transport = new SSEServerTransport('/message', res);
-      const sessionId = Date.now().toString();
+    // SSE endpoint - establishes connection
+    if (url.pathname === '/sse' && req.method === 'GET') {
+      console.log('New SSE connection');
+
+      const sessionId = crypto.randomUUID();
+      const transport = new SSEServerTransport(`/message?sessionId=${sessionId}`, res);
       transports.set(sessionId, transport);
 
       res.on('close', () => {
+        console.log(`SSE connection closed: ${sessionId}`);
         transports.delete(sessionId);
       });
 
       await server.connect(transport);
+      console.log(`SSE connected: ${sessionId}`);
       return;
     }
 
     // Message endpoint for SSE
-    if (req.url === '/message' && req.method === 'POST') {
+    if (url.pathname === '/message' && req.method === 'POST') {
+      const sessionId = url.searchParams.get('sessionId');
+
+      if (!sessionId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing sessionId' }));
+        return;
+      }
+
+      const transport = transports.get(sessionId);
+      if (!transport) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Session not found' }));
+        return;
+      }
+
       let body = '';
-      req.on('data', (chunk) => { body += chunk; });
+      req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
       req.on('end', async () => {
-        // Find an active transport and handle the message
-        for (const transport of transports.values()) {
-          try {
-            await transport.handlePostMessage(req, res, body);
-            return;
-          } catch {
-            // Try next transport
+        try {
+          await transport.handlePostMessage(req, res, body);
+        } catch (error) {
+          console.error('Message handling error:', error);
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal error' }));
           }
         }
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'No active session' }));
       });
       return;
     }
