@@ -281,35 +281,55 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// SSE endpoint for MCP
+// SSE endpoint for MCP - Poke connects here
 app.get('/sse', async (req, res) => {
-  console.log('[MCP] New SSE connection');
+  console.log('[MCP] New SSE connection from:', req.ip);
 
+  // Set up SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.flushHeaders();
+
+  // Create transport - the path is where clients POST messages back
   const transport = new SSEServerTransport('/message', res);
-  const sessionId = Math.random().toString(36).substring(7);
+  const sessionId = transport.sessionId;
   transports.set(sessionId, transport);
+
+  console.log('[MCP] Session created:', sessionId);
 
   const server = createServer();
 
   res.on('close', () => {
-    console.log('[MCP] SSE connection closed');
+    console.log('[MCP] SSE connection closed:', sessionId);
     transports.delete(sessionId);
   });
 
-  await server.connect(transport);
+  try {
+    await server.connect(transport);
+    console.log('[MCP] Server connected to transport');
+  } catch (err) {
+    console.error('[MCP] Failed to connect:', err);
+  }
 });
 
-// Message endpoint for MCP
+// Message endpoint for MCP - clients POST messages here
 app.post('/message', express.json(), async (req, res) => {
-  // Find the transport that matches this session
-  // The SSE transport handles message routing internally
+  console.log('[MCP] Message received, sessionId:', req.query.sessionId);
+
   const sessionId = req.query.sessionId as string;
   const transport = transports.get(sessionId);
 
   if (transport) {
-    // The transport handles the message
-    await transport.handlePostMessage(req, res);
+    try {
+      await transport.handlePostMessage(req, res);
+    } catch (err) {
+      console.error('[MCP] Error handling message:', err);
+      res.status(500).json({ error: 'Internal error' });
+    }
   } else {
+    console.log('[MCP] No transport for session:', sessionId, 'Available:', [...transports.keys()]);
     res.status(400).json({ error: 'No active session' });
   }
 });
