@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { resyClient } from './resy-client.js';
 import { openTableClient } from './opentable-client.js';
 import { randomUUID } from 'crypto';
+import axios from 'axios';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -200,6 +201,25 @@ Common NYC venue IDs:
             partySize: { type: ['string', 'number'], description: 'Number of guests (defaults to 2)' },
           },
           required: ['venueId', 'date'],
+        },
+      },
+      {
+        name: 'lookup_venue_id',
+        description: `Look up a Resy venue ID from a restaurant name or Resy URL.
+
+EXAMPLES:
+- lookup_venue_id(url: "https://resy.com/cities/ny/carbone")
+- lookup_venue_id(name: "Carbone", city: "ny")
+- lookup_venue_id(name: "Bestia", city: "la")
+
+City codes: ny, la, sf, chi, mia, dc, las-vegas, austin, denver, seattle, boston, etc.`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: { type: 'string', description: 'Full Resy URL (e.g., https://resy.com/cities/ny/carbone)' },
+            name: { type: 'string', description: 'Restaurant name (use with city)' },
+            city: { type: 'string', description: 'City code: ny, la, sf, chi, mia, dc, etc.' },
+          },
         },
       },
     ],
@@ -499,6 +519,121 @@ Common NYC venue IDs:
               }, null, 2),
             }],
           };
+        }
+
+        case 'lookup_venue_id': {
+          const url = (args as any).url;
+          const name = (args as any).name;
+          const city = (args as any).city;
+
+          let targetUrl: string;
+
+          if (url) {
+            targetUrl = url;
+          } else if (name && city) {
+            // Convert name to URL slug: "Don Angie" -> "don-angie"
+            const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+            targetUrl = `https://resy.com/cities/${city.toLowerCase()}/${slug}`;
+          } else {
+            return {
+              content: [{ type: 'text', text: 'Provide either url, or both name and city. Example: name: "Carbone", city: "ny"' }],
+              isError: true,
+            };
+          }
+
+          console.log(`[Resy] Looking up venue ID from: ${targetUrl}`);
+
+          try {
+            const response = await axios.get(targetUrl, {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              },
+              timeout: 10000,
+            });
+
+            const html = response.data as string;
+
+            // Try multiple patterns to extract venue ID
+            let venueId: number | null = null;
+            let venueName: string | null = null;
+
+            // Pattern 1: Look for venue ID in JSON data
+            const jsonMatch = html.match(/"venue":\s*\{[^}]*"id":\s*\{[^}]*"resy":\s*(\d+)/);
+            if (jsonMatch) {
+              venueId = parseInt(jsonMatch[1], 10);
+            }
+
+            // Pattern 2: Look for data-venue-id attribute
+            if (!venueId) {
+              const attrMatch = html.match(/data-venue-id="(\d+)"/);
+              if (attrMatch) {
+                venueId = parseInt(attrMatch[1], 10);
+              }
+            }
+
+            // Pattern 3: Look for venue_id in script tags
+            if (!venueId) {
+              const scriptMatch = html.match(/venue_id['":\s]+(\d+)/);
+              if (scriptMatch) {
+                venueId = parseInt(scriptMatch[1], 10);
+              }
+            }
+
+            // Pattern 4: Look for "resy": followed by number
+            if (!venueId) {
+              const resyMatch = html.match(/"resy":\s*(\d+)/);
+              if (resyMatch) {
+                venueId = parseInt(resyMatch[1], 10);
+              }
+            }
+
+            // Try to extract venue name
+            const nameMatch = html.match(/<title>([^<|]+)/);
+            if (nameMatch) {
+              venueName = nameMatch[1].trim();
+            }
+
+            if (venueId) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    success: true,
+                    venueId,
+                    restaurantId: `resy-${venueId}`,
+                    name: venueName,
+                    url: targetUrl,
+                    note: 'Use this venueId with get_venue_availability to check availability.',
+                  }, null, 2),
+                }],
+              };
+            } else {
+              return {
+                content: [{
+                  type: 'text',
+                  text: `Could not find venue ID at ${targetUrl}. The restaurant may not exist on Resy or the URL format may be different. Try the exact URL from resy.com.`,
+                }],
+              };
+            }
+          } catch (error) {
+            const status = (error as any).response?.status;
+            if (status === 404) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: `Restaurant not found at ${targetUrl}. Check the URL or try a different name/city combination.`,
+                }],
+              };
+            }
+            return {
+              content: [{
+                type: 'text',
+                text: `Error fetching ${targetUrl}: ${error instanceof Error ? error.message : 'Unknown error'}`,
+              }],
+              isError: true,
+            };
+          }
         }
 
         default:
