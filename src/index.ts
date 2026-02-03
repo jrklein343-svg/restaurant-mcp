@@ -692,10 +692,19 @@ async function main() {
 
     // SSE endpoint - establishes connection (supports both /sse and /mcp)
     if ((url.pathname === '/sse' || url.pathname === '/mcp') && req.method === 'GET') {
-      console.log('New SSE connection');
+      console.log('New SSE connection request');
+      console.log('Headers:', JSON.stringify(req.headers));
 
       const sessionId = crypto.randomUUID();
-      const transport = new SSEServerTransport(`/message?sessionId=${sessionId}`, res);
+
+      // Build the full message URL that Poke will use to send messages
+      const protocol = req.headers['x-forwarded-proto'] || 'https';
+      const host = req.headers['host'] || 'localhost:3000';
+      const messageUrl = `${protocol}://${host}/message?sessionId=${sessionId}`;
+
+      console.log(`Creating SSE transport with message URL: ${messageUrl}`);
+
+      const transport = new SSEServerTransport(messageUrl, res);
       transports.set(sessionId, transport);
 
       res.on('close', () => {
@@ -703,8 +712,12 @@ async function main() {
         transports.delete(sessionId);
       });
 
-      await server.connect(transport);
-      console.log(`SSE connected: ${sessionId}`);
+      try {
+        await server.connect(transport);
+        console.log(`SSE connected successfully: ${sessionId}`);
+      } catch (error) {
+        console.error(`SSE connection error: ${error}`);
+      }
       return;
     }
 
