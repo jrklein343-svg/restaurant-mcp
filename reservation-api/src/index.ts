@@ -13,32 +13,70 @@ import { randomUUID } from 'crypto';
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
-// Tool schemas
+// Helper: Parse date from various formats
+function parseDate(input: string | undefined): string {
+  if (!input) return new Date().toISOString().split('T')[0];
+  if (/^\d{4}-\d{2}-\d{2}$/.test(input)) return input;
+  const date = new Date(input);
+  if (isNaN(date.getTime())) {
+    throw new Error(`Invalid date: ${input}. Use YYYY-MM-DD format or natural language.`);
+  }
+  return date.toISOString().split('T')[0];
+}
+
+// Helper: Parse restaurant ID
+function parseRestaurantId(input: string | number): { id: number; platform: 'resy' | 'opentable' | null } {
+  const str = String(input);
+  if (str.toLowerCase().startsWith('resy-')) {
+    return { id: parseInt(str.slice(5), 10), platform: 'resy' };
+  }
+  if (str.toLowerCase().startsWith('opentable-')) {
+    return { id: parseInt(str.slice(10), 10), platform: 'opentable' };
+  }
+  return { id: parseInt(str, 10), platform: null };
+}
+
+// Helper: Parse party size
+function parsePartySize(input: string | number | undefined): number {
+  if (!input) return 2;
+  const size = typeof input === 'string' ? parseInt(input, 10) : input;
+  if (isNaN(size) || size < 1 || size > 20) return 2;
+  return size;
+}
+
+// Flexible schemas
 const searchSchema = z.object({
-  query: z.string().min(1).describe('Restaurant name or search term'),
-  location: z.string().min(1).describe('City or neighborhood'),
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('Date in YYYY-MM-DD format'),
-  partySize: z.number().int().min(1).max(20).default(2).describe('Number of guests'),
-  platform: z.enum(['resy', 'opentable', 'both']).default('both').describe('Platform to search'),
+  query: z.string().min(1),
+  location: z.string().min(1),
+  date: z.string().optional(),
+  partySize: z.union([z.string(), z.number()]).optional(),
+  party_size: z.union([z.string(), z.number()]).optional(), // alias
+  platform: z.enum(['resy', 'opentable', 'both']).optional(),
 });
 
 const availabilitySchema = z.object({
-  restaurantId: z.string().min(1).describe('Restaurant ID (e.g., resy-12345 or opentable-67890)'),
-  platform: z.enum(['resy', 'opentable']).describe('Platform (resy or opentable)'),
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('Date in YYYY-MM-DD format'),
-  partySize: z.number().int().min(1).max(20).describe('Number of guests'),
+  restaurantId: z.union([z.string(), z.number()]),
+  restaurant_id: z.union([z.string(), z.number()]).optional(), // alias
+  platform: z.enum(['resy', 'opentable']).optional(),
+  date: z.string(),
+  partySize: z.union([z.string(), z.number()]).optional(),
+  party_size: z.union([z.string(), z.number()]).optional(), // alias
 });
 
 const reserveSchema = z.object({
-  restaurantId: z.string().min(1).describe('Restaurant ID'),
-  platform: z.enum(['resy', 'opentable']).describe('Platform'),
-  slotId: z.string().min(1).describe('Time slot ID from availability check'),
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('Date in YYYY-MM-DD format'),
-  partySize: z.number().int().min(1).max(20).describe('Number of guests'),
+  restaurantId: z.union([z.string(), z.number()]),
+  restaurant_id: z.union([z.string(), z.number()]).optional(), // alias
+  platform: z.enum(['resy', 'opentable']).optional(),
+  slotId: z.string(),
+  slot_id: z.string().optional(), // alias
+  date: z.string(),
+  partySize: z.union([z.string(), z.number()]).optional(),
+  party_size: z.union([z.string(), z.number()]).optional(), // alias
 });
 
 const cancelSchema = z.object({
-  reservationId: z.string().min(1).describe('Reservation ID to cancel'),
+  reservationId: z.string(),
+  reservation_id: z.string().optional(), // alias
 });
 
 // Create MCP server
@@ -55,163 +93,290 @@ function createServer(): Server {
     }
   );
 
-  // List available tools
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       {
         name: 'search_restaurants',
-        description: 'Search for restaurants on Resy and/or OpenTable by name, cuisine, or location',
+        description: `Search for restaurants on Resy and OpenTable.
+
+EXAMPLES:
+- search_restaurants(query: "Italian", location: "New York")
+- search_restaurants(query: "Carbone", location: "NYC", partySize: 4)
+- search_restaurants(query: "sushi", location: "Los Angeles", platform: "resy")
+
+DEFAULTS: partySize=2, platform=both (searches Resy + OpenTable), date=today`,
         inputSchema: {
           type: 'object',
           properties: {
-            query: { type: 'string', description: 'Restaurant name or search term' },
-            location: { type: 'string', description: 'City or neighborhood' },
-            date: { type: 'string', description: 'Date in YYYY-MM-DD format (optional)' },
-            partySize: { type: 'number', description: 'Number of guests (default: 2)' },
-            platform: { type: 'string', enum: ['resy', 'opentable', 'both'], description: 'Platform to search (default: both)' },
+            query: { type: 'string', description: 'Restaurant name, cuisine, or search term' },
+            location: { type: 'string', description: 'City or neighborhood (e.g., "New York", "SF", "Los Angeles")' },
+            date: { type: 'string', description: 'Date for availability (optional, defaults to today)' },
+            partySize: { type: ['string', 'number'], description: 'Number of guests (optional, defaults to 2)' },
+            platform: { type: 'string', enum: ['resy', 'opentable', 'both'], description: 'Where to search (optional, defaults to both)' },
           },
           required: ['query', 'location'],
         },
       },
       {
         name: 'check_availability',
-        description: 'Get available time slots for a specific restaurant on a specific date',
+        description: `Get available time slots for a restaurant.
+
+EXAMPLES:
+- check_availability(restaurantId: "resy-12345", date: "2026-02-15", partySize: 2)
+- check_availability(restaurantId: 12345, platform: "resy", date: "2026-02-15")
+
+The restaurantId comes from search_restaurants results.`,
         inputSchema: {
           type: 'object',
           properties: {
-            restaurantId: { type: 'string', description: 'Restaurant ID (e.g., resy-12345)' },
-            platform: { type: 'string', enum: ['resy', 'opentable'], description: 'Platform' },
-            date: { type: 'string', description: 'Date in YYYY-MM-DD format' },
-            partySize: { type: 'number', description: 'Number of guests' },
+            restaurantId: { type: ['string', 'number'], description: 'Restaurant ID from search results (e.g., "resy-12345" or 12345)' },
+            platform: { type: 'string', enum: ['resy', 'opentable'], description: 'Platform (can be auto-detected from restaurantId prefix)' },
+            date: { type: 'string', description: 'Date (YYYY-MM-DD or natural language)' },
+            partySize: { type: ['string', 'number'], description: 'Number of guests (defaults to 2)' },
           },
-          required: ['restaurantId', 'platform', 'date', 'partySize'],
+          required: ['restaurantId', 'date'],
         },
       },
       {
         name: 'make_reservation',
-        description: 'Book a reservation at a restaurant. For OpenTable, returns a booking URL to complete on their site.',
+        description: `Book a reservation. For Resy: books directly. For OpenTable: returns booking URL.
+
+EXAMPLE:
+- make_reservation(restaurantId: "resy-12345", slotId: "config_token_here", date: "2026-02-15", partySize: 2)
+
+The slotId comes from check_availability results.`,
         inputSchema: {
           type: 'object',
           properties: {
-            restaurantId: { type: 'string', description: 'Restaurant ID' },
-            platform: { type: 'string', enum: ['resy', 'opentable'], description: 'Platform' },
+            restaurantId: { type: ['string', 'number'], description: 'Restaurant ID' },
+            platform: { type: 'string', enum: ['resy', 'opentable'], description: 'Platform (auto-detected from ID prefix)' },
             slotId: { type: 'string', description: 'Time slot ID from availability check' },
-            date: { type: 'string', description: 'Date in YYYY-MM-DD format' },
-            partySize: { type: 'number', description: 'Number of guests' },
+            date: { type: 'string', description: 'Reservation date' },
+            partySize: { type: ['string', 'number'], description: 'Number of guests' },
           },
-          required: ['restaurantId', 'platform', 'slotId', 'date', 'partySize'],
+          required: ['restaurantId', 'slotId', 'date'],
         },
       },
       {
         name: 'list_reservations',
-        description: 'List your upcoming Resy reservations',
-        inputSchema: {
-          type: 'object',
-          properties: {},
-        },
+        description: 'List your upcoming Resy reservations. No parameters needed.',
+        inputSchema: { type: 'object', properties: {} },
       },
       {
         name: 'cancel_reservation',
-        description: 'Cancel a Resy reservation',
+        description: 'Cancel a Resy reservation by ID.',
         inputSchema: {
           type: 'object',
           properties: {
-            reservationId: { type: 'string', description: 'Reservation ID to cancel' },
+            reservationId: { type: 'string', description: 'The reservation ID to cancel' },
           },
           required: ['reservationId'],
         },
       },
       {
         name: 'check_auth_status',
-        description: 'Check if Resy authentication is valid',
-        inputSchema: {
-          type: 'object',
-          properties: {},
-        },
+        description: 'Check if Resy authentication is working. No parameters needed.',
+        inputSchema: { type: 'object', properties: {} },
       },
     ],
   }));
 
-  // Handle tool calls
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
     try {
       switch (name) {
         case 'search_restaurants': {
-          const input = searchSchema.parse(args);
-          const date = input.date || new Date().toISOString().split('T')[0];
+          const raw = searchSchema.parse(args);
+          const date = parseDate(raw.date);
+          const partySize = parsePartySize(raw.partySize || raw.party_size);
+          const platform = raw.platform || 'both';
+
           const results: any[] = [];
+          const errors: string[] = [];
 
           const promises: Promise<void>[] = [];
 
-          if (input.platform === 'resy' || input.platform === 'both') {
+          if (platform === 'resy' || platform === 'both') {
             promises.push(
-              resyClient.search(input.query, input.location, date, input.partySize)
-                .then((r) => r.forEach((x) => results.push({ ...x, platform: 'resy', id: `resy-${x.id}` })))
-                .catch(() => {})
+              resyClient.search(raw.query, raw.location, date, partySize)
+                .then((r) => r.forEach((x) => results.push({
+                  id: `resy-${x.id}`,
+                  name: x.name,
+                  location: x.location,
+                  neighborhood: x.neighborhood,
+                  cuisine: x.cuisine,
+                  priceRange: x.priceRange,
+                  rating: x.rating,
+                  platform: 'resy',
+                })))
+                .catch((e) => errors.push(`Resy: ${e.message}`))
             );
           }
 
-          if (input.platform === 'opentable' || input.platform === 'both') {
+          if (platform === 'opentable' || platform === 'both') {
             promises.push(
-              openTableClient.search(input.query, input.location)
-                .then((r) => r.forEach((x) => results.push({ ...x, platform: 'opentable', id: `opentable-${x.id}` })))
-                .catch(() => {})
+              openTableClient.search(raw.query, raw.location)
+                .then((r) => r.forEach((x) => results.push({
+                  id: `opentable-${x.id}`,
+                  name: x.name,
+                  address: x.address,
+                  city: x.city,
+                  cuisine: x.cuisine,
+                  priceRange: x.priceRange,
+                  rating: x.rating,
+                  platform: 'opentable',
+                })))
+                .catch((e) => errors.push(`OpenTable: ${e.message}`))
             );
           }
 
           await Promise.all(promises);
+
+          if (results.length === 0) {
+            return {
+              content: [{
+                type: 'text',
+                text: `No restaurants found for "${raw.query}" in ${raw.location}.${errors.length ? ` Errors: ${errors.join(', ')}` : ''} Try a different search term or location.`,
+              }],
+            };
+          }
+
           return {
-            content: [{ type: 'text', text: JSON.stringify({ results }, null, 2) }],
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                query: raw.query,
+                location: raw.location,
+                date,
+                partySize,
+                resultCount: results.length,
+                results: results.slice(0, 20), // Limit to 20 results
+                note: results.length > 20 ? `Showing first 20 of ${results.length} results.` : undefined,
+              }, null, 2),
+            }],
           };
         }
 
         case 'check_availability': {
-          const input = availabilitySchema.parse(args);
-          const numericId = parseInt(input.restaurantId.replace(/^(resy|opentable)-/, ''), 10);
+          const raw = availabilitySchema.parse(args);
+          const restaurantIdRaw = raw.restaurantId || raw.restaurant_id;
+          const { id: numericId, platform: detectedPlatform } = parseRestaurantId(restaurantIdRaw!);
+          const platform = raw.platform || detectedPlatform;
+          const date = parseDate(raw.date);
+          const partySize = parsePartySize(raw.partySize || raw.party_size);
 
-          if (input.platform === 'resy') {
-            const slots = await resyClient.getAvailability(numericId, input.date, input.partySize);
+          if (!platform) {
             return {
-              content: [{ type: 'text', text: JSON.stringify({ platform: 'resy', slots }, null, 2) }],
+              content: [{ type: 'text', text: 'Platform required. Use "resy" or "opentable", or prefix ID like "resy-12345".' }],
+              isError: true,
+            };
+          }
+
+          if (platform === 'resy') {
+            const slots = await resyClient.getAvailability(numericId, date, partySize);
+            if (slots.length === 0) {
+              return {
+                content: [{ type: 'text', text: `No availability found for restaurant ${numericId} on ${date} for ${partySize} guests.` }],
+              };
+            }
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  platform: 'resy',
+                  restaurantId: numericId,
+                  date,
+                  partySize,
+                  slotCount: slots.length,
+                  slots: slots.map(s => ({
+                    time: s.time,
+                    slotId: s.slotId,
+                    type: s.type,
+                  })),
+                  note: 'Use the slotId with make_reservation to book.',
+                }, null, 2),
+              }],
             };
           } else {
-            const slots = await openTableClient.getAvailability(numericId, input.date, input.partySize);
+            const slots = await openTableClient.getAvailability(numericId, date, partySize);
+            if (slots.length === 0) {
+              return {
+                content: [{ type: 'text', text: `No availability found for restaurant ${numericId} on ${date} for ${partySize} guests.` }],
+              };
+            }
             return {
-              content: [{ type: 'text', text: JSON.stringify({ platform: 'opentable', slots }, null, 2) }],
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  platform: 'opentable',
+                  restaurantId: numericId,
+                  date,
+                  partySize,
+                  slotCount: slots.length,
+                  slots: slots.map(s => ({
+                    time: s.time,
+                    bookingUrl: s.bookingUrl,
+                  })),
+                  note: 'OpenTable requires completing booking on their website. Use the bookingUrl.',
+                }, null, 2),
+              }],
             };
           }
         }
 
         case 'make_reservation': {
-          const input = reserveSchema.parse(args);
+          const raw = reserveSchema.parse(args);
+          const restaurantIdRaw = raw.restaurantId || raw.restaurant_id;
+          const slotId = raw.slotId || raw.slot_id;
+          const { id: numericId, platform: detectedPlatform } = parseRestaurantId(restaurantIdRaw!);
+          const platform = raw.platform || detectedPlatform;
+          const date = parseDate(raw.date);
+          const partySize = parsePartySize(raw.partySize || raw.party_size);
 
-          if (input.platform === 'opentable') {
-            const numericId = parseInt(input.restaurantId.replace(/^opentable-/, ''), 10);
-            const bookingUrl = `https://www.opentable.com/booking/experiences-availability?rid=${numericId}&datetime=${input.date}T${input.slotId}&covers=${input.partySize}`;
+          if (!platform) {
+            return {
+              content: [{ type: 'text', text: 'Platform required. Use "resy" or "opentable", or prefix ID like "resy-12345".' }],
+              isError: true,
+            };
+          }
+
+          if (!slotId) {
+            return {
+              content: [{ type: 'text', text: 'slotId required. Get it from check_availability results.' }],
+              isError: true,
+            };
+          }
+
+          if (platform === 'opentable') {
+            const bookingUrl = `https://www.opentable.com/booking/experiences-availability?rid=${numericId}&datetime=${date}T${slotId}&covers=${partySize}`;
             return {
               content: [{
                 type: 'text',
                 text: JSON.stringify({
                   success: true,
                   platform: 'opentable',
+                  message: '⚠️ OpenTable requires completing booking on their website.',
                   bookingUrl,
-                  message: 'Complete booking at the URL above',
+                  instructions: 'Click the booking URL to complete your reservation on OpenTable.',
                 }, null, 2),
               }],
             };
           }
 
-          const details = await resyClient.getBookingDetails(input.slotId, input.date, input.partySize);
+          const details = await resyClient.getBookingDetails(slotId, date, partySize);
           const result = await resyClient.makeReservation(details.bookToken, details.paymentMethodId);
+
           return {
             content: [{
               type: 'text',
               text: JSON.stringify({
                 success: true,
+                message: '✅ Reservation confirmed!',
                 platform: 'resy',
                 reservationId: result.reservationId,
+                date,
+                partySize,
               }, null, 2),
             }],
           };
@@ -219,16 +384,34 @@ function createServer(): Server {
 
         case 'list_reservations': {
           const reservations = await resyClient.getReservations();
+          if (reservations.length === 0) {
+            return {
+              content: [{ type: 'text', text: 'No upcoming reservations found.' }],
+            };
+          }
           return {
-            content: [{ type: 'text', text: JSON.stringify({ reservations }, null, 2) }],
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                count: reservations.length,
+                reservations,
+              }, null, 2),
+            }],
           };
         }
 
         case 'cancel_reservation': {
-          const input = cancelSchema.parse(args);
-          await resyClient.cancelReservation(input.reservationId);
+          const raw = cancelSchema.parse(args);
+          const reservationId = raw.reservationId || raw.reservation_id;
+          if (!reservationId) {
+            return {
+              content: [{ type: 'text', text: 'reservationId required.' }],
+              isError: true,
+            };
+          }
+          await resyClient.cancelReservation(reservationId);
           return {
-            content: [{ type: 'text', text: JSON.stringify({ success: true }, null, 2) }],
+            content: [{ type: 'text', text: `✅ Reservation ${reservationId} cancelled.` }],
           };
         }
 
@@ -236,17 +419,15 @@ function createServer(): Server {
           try {
             await resyClient.ensureAuth();
             return {
-              content: [{ type: 'text', text: JSON.stringify({ authenticated: true }, null, 2) }],
+              content: [{ type: 'text', text: '✅ Resy authentication is working.' }],
             };
           } catch (error) {
             return {
               content: [{
                 type: 'text',
-                text: JSON.stringify({
-                  authenticated: false,
-                  error: error instanceof Error ? error.message : 'Unknown error',
-                }, null, 2),
+                text: `❌ Resy authentication failed: ${error instanceof Error ? error.message : 'Unknown'}`,
               }],
+              isError: true,
             };
           }
         }
@@ -259,13 +440,14 @@ function createServer(): Server {
       }
     } catch (error) {
       if (error instanceof z.ZodError) {
+        const issues = error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
         return {
-          content: [{ type: 'text', text: `Invalid input: ${JSON.stringify(error.errors)}` }],
+          content: [{ type: 'text', text: `Invalid input: ${issues}` }],
           isError: true,
         };
       }
       return {
-        content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}` }],
+        content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : 'Unknown'}` }],
         isError: true,
       };
     }
@@ -274,10 +456,9 @@ function createServer(): Server {
   return server;
 }
 
-// Store active sessions
+// Session management
 const sessions = new Map<string, { server: Server; transport: StreamableHTTPServerTransport }>();
 
-// Enable CORS for all routes
 app.use((_req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
@@ -285,86 +466,48 @@ app.use((_req, res, next) => {
   next();
 });
 
-app.options('*', (_req, res) => {
-  res.status(200).end();
-});
+app.options('*', (_req, res) => res.status(200).end());
 
-// Health check endpoint
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// MCP endpoint - Streamable HTTP transport
 app.all('/mcp', express.json(), async (req, res) => {
-  console.log(`[MCP] ${req.method} /mcp from:`, req.ip);
-
-  // Handle GET for SSE stream (session notifications)
   if (req.method === 'GET') {
     const sessionId = req.headers['mcp-session-id'] as string;
-    console.log('[MCP] GET request, session:', sessionId);
-
     if (!sessionId || !sessions.has(sessionId)) {
-      res.status(400).json({ error: 'Invalid or missing session ID' });
+      res.status(400).json({ error: 'Invalid session' });
       return;
     }
-
-    // Set up SSE for notifications
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
-
-    req.on('close', () => {
-      console.log('[MCP] SSE connection closed for session:', sessionId);
-    });
     return;
   }
 
-  // Handle DELETE for session termination
   if (req.method === 'DELETE') {
     const sessionId = req.headers['mcp-session-id'] as string;
-    console.log('[MCP] DELETE session:', sessionId);
-
     if (sessionId && sessions.has(sessionId)) {
-      const session = sessions.get(sessionId)!;
-      await session.server.close();
+      await sessions.get(sessionId)!.server.close();
       sessions.delete(sessionId);
     }
     res.status(200).json({ success: true });
     return;
   }
 
-  // Handle POST for messages
   if (req.method === 'POST') {
     let sessionId = req.headers['mcp-session-id'] as string;
-    console.log('[MCP] POST request, session:', sessionId, 'body:', JSON.stringify(req.body));
-
-    // Create new session if needed (for initialize request)
     if (!sessionId || !sessions.has(sessionId)) {
       sessionId = randomUUID();
-      console.log('[MCP] Creating new session:', sessionId);
-
       const server = createServer();
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => sessionId,
-      });
-
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId });
       sessions.set(sessionId, { server, transport });
-
       await server.connect(transport);
-      console.log('[MCP] Server connected to transport');
     }
-
-    const session = sessions.get(sessionId)!;
-
     try {
-      // Handle the request through the transport
-      await session.transport.handleRequest(req, res, req.body);
+      await sessions.get(sessionId)!.transport.handleRequest(req, res, req.body);
     } catch (err) {
-      console.error('[MCP] Error handling request:', err);
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Internal error', message: err instanceof Error ? err.message : 'Unknown' });
-      }
+      if (!res.headersSent) res.status(500).json({ error: 'Internal error' });
     }
     return;
   }
@@ -373,21 +516,14 @@ app.all('/mcp', express.json(), async (req, res) => {
 });
 
 async function main() {
-  console.log('[MCP Server] Starting Restaurant Reservation MCP Server...');
-
+  console.log('[MCP] Starting Restaurant Reservation Server...');
   try {
     await resyClient.ensureAuth();
-    console.log('[MCP Server] Resy authentication successful');
-  } catch (error) {
-    console.warn('[MCP Server] Resy auth failed:', error instanceof Error ? error.message : error);
-    console.warn('[MCP Server] Set RESY_EMAIL and RESY_PASSWORD environment variables');
+    console.log('[MCP] Resy auth successful');
+  } catch (e) {
+    console.warn('[MCP] Resy auth failed:', e instanceof Error ? e.message : e);
   }
-
-  app.listen(PORT, () => {
-    console.log(`[MCP Server] Listening on port ${PORT}`);
-    console.log('[MCP Server] MCP endpoint: /mcp');
-    console.log('[MCP Server] Health check: /health');
-  });
+  app.listen(PORT, () => console.log(`[MCP] Listening on port ${PORT}`));
 }
 
 main().catch(console.error);

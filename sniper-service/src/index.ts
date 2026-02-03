@@ -14,19 +14,101 @@ import { randomUUID } from 'crypto';
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
-// Schemas
+// Helper: Parse restaurant ID from various formats
+function parseRestaurantId(input: string | number): number {
+  if (typeof input === 'number') return input;
+  // Remove prefixes like "resy-" or "opentable-"
+  const cleaned = String(input).replace(/^(resy|opentable)-/i, '');
+  const num = parseInt(cleaned, 10);
+  if (isNaN(num)) throw new Error(`Invalid restaurant ID: ${input}. Must be a number or "resy-12345" format.`);
+  return num;
+}
+
+// Helper: Parse date from various formats
+function parseDate(input: string): string {
+  // Already in YYYY-MM-DD format
+  if (/^\d{4}-\d{2}-\d{2}$/.test(input)) return input;
+
+  // Try parsing common formats
+  const date = new Date(input);
+  if (isNaN(date.getTime())) {
+    throw new Error(`Invalid date: ${input}. Use YYYY-MM-DD format (e.g., "2026-02-15") or natural language like "February 15, 2026".`);
+  }
+  return date.toISOString().split('T')[0];
+}
+
+// Helper: Parse release time from various formats
+function parseReleaseTime(input: string, targetDate: string): string {
+  // Already valid ISO format
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(input)) {
+    return new Date(input).toISOString();
+  }
+
+  // Try parsing as date
+  let date = new Date(input);
+  if (!isNaN(date.getTime())) {
+    return date.toISOString();
+  }
+
+  // Try parsing as time only (e.g., "9:00 AM", "09:00")
+  const timeMatch = input.match(/^(\d{1,2}):?(\d{2})?\s*(am|pm)?$/i);
+  if (timeMatch) {
+    let hours = parseInt(timeMatch[1], 10);
+    const minutes = parseInt(timeMatch[2] || '0', 10);
+    const meridiem = (timeMatch[3] || '').toLowerCase();
+
+    if (meridiem === 'pm' && hours < 12) hours += 12;
+    if (meridiem === 'am' && hours === 12) hours = 0;
+
+    // Default to today or tomorrow for release
+    const today = new Date();
+    today.setHours(hours, minutes, 0, 0);
+
+    // If time already passed today, use tomorrow
+    if (today.getTime() < Date.now()) {
+      today.setDate(today.getDate() + 1);
+    }
+
+    return today.toISOString();
+  }
+
+  throw new Error(`Invalid release time: ${input}. Use ISO format "2026-02-01T09:00:00" or simple time like "9:00 AM".`);
+}
+
+// Helper: Normalize preferred times
+function normalizePreferredTimes(input: string | string[]): string[] {
+  if (Array.isArray(input)) return input;
+  // Single time as string
+  if (typeof input === 'string') {
+    // Check if comma-separated
+    if (input.includes(',')) {
+      return input.split(',').map(t => t.trim());
+    }
+    return [input];
+  }
+  return ['7:00 PM']; // Default
+}
+
+// Helper: Detect platform from restaurant ID
+function detectPlatform(restaurantId: string | number): 'resy' | 'opentable' {
+  const str = String(restaurantId).toLowerCase();
+  if (str.startsWith('opentable-')) return 'opentable';
+  return 'resy'; // Default to resy
+}
+
+// Flexible schema - accepts many input formats
 const createSnipeSchema = z.object({
-  restaurantId: z.number().int().positive().describe('Numeric restaurant ID'),
-  restaurantName: z.string().min(1).describe('Restaurant name for notifications'),
-  platform: z.enum(['resy', 'opentable']).describe('Platform (resy or opentable)'),
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('Target date YYYY-MM-DD'),
-  partySize: z.number().int().min(1).max(20).describe('Number of guests'),
-  preferredTimes: z.array(z.string()).min(1).max(10).describe('Preferred times like ["7:00 PM", "7:30 PM"]'),
-  releaseTime: z.string().describe('When reservations open (ISO 8601)'),
+  restaurantId: z.union([z.string(), z.number()]),
+  restaurantName: z.string().min(1),
+  platform: z.enum(['resy', 'opentable']).optional(),
+  date: z.string().min(1),
+  partySize: z.union([z.string(), z.number()]).optional().default(2),
+  preferredTimes: z.union([z.string(), z.array(z.string())]).optional().default(['7:00 PM', '7:30 PM', '8:00 PM']),
+  releaseTime: z.string().min(1),
 });
 
 const snipeIdSchema = z.object({
-  snipeId: z.string().min(1).describe('Snipe ID to operate on'),
+  snipeId: z.string().min(1),
 });
 
 // Create MCP server
@@ -48,28 +130,52 @@ function createServer(): Server {
     tools: [
       {
         name: 'create_snipe',
-        description: 'Schedule a snipe to automatically book a reservation the instant slots open. The sniper will poll aggressively at release time and book the first available slot from your preferred times.',
+        description: `Schedule an automatic reservation snipe. The sniper will book instantly when slots open.
+
+EXAMPLES:
+- Simple: create_snipe(restaurantId: 12345, restaurantName: "Carbone", date: "2026-02-15", releaseTime: "9:00 AM")
+- Full: create_snipe(restaurantId: "resy-12345", restaurantName: "Carbone", platform: "resy", date: "2026-02-15", partySize: 2, preferredTimes: ["7:00 PM", "7:30 PM"], releaseTime: "2026-02-01T09:00:00")
+
+DEFAULTS: partySize=2, preferredTimes=["7:00 PM", "7:30 PM", "8:00 PM"], platform=resy`,
         inputSchema: {
           type: 'object',
           properties: {
-            restaurantId: { type: 'number', description: 'Numeric restaurant ID' },
-            restaurantName: { type: 'string', description: 'Restaurant name for notifications' },
-            platform: { type: 'string', enum: ['resy', 'opentable'], description: 'Platform (resy or opentable)' },
-            date: { type: 'string', description: 'Target date YYYY-MM-DD' },
-            partySize: { type: 'number', description: 'Number of guests' },
-            preferredTimes: {
-              type: 'array',
-              items: { type: 'string' },
-              description: 'Preferred times like ["7:00 PM", "7:30 PM"]'
+            restaurantId: {
+              type: ['string', 'number'],
+              description: 'Restaurant ID. Can be number (12345) or string ("resy-12345")'
             },
-            releaseTime: { type: 'string', description: 'When reservations open (ISO 8601 datetime)' },
+            restaurantName: {
+              type: 'string',
+              description: 'Restaurant name (for notifications)'
+            },
+            platform: {
+              type: 'string',
+              enum: ['resy', 'opentable'],
+              description: 'Platform (optional, defaults to resy)'
+            },
+            date: {
+              type: 'string',
+              description: 'Reservation date. Accepts "2026-02-15" or "February 15, 2026"'
+            },
+            partySize: {
+              type: ['string', 'number'],
+              description: 'Number of guests (optional, defaults to 2)'
+            },
+            preferredTimes: {
+              type: ['string', 'array'],
+              description: 'Preferred times. Can be single "7:00 PM" or array ["7:00 PM", "7:30 PM"] or comma-separated "7:00 PM, 7:30 PM". Defaults to dinner times.'
+            },
+            releaseTime: {
+              type: 'string',
+              description: 'When reservations open. Accepts "9:00 AM" or "2026-02-01T09:00:00"'
+            },
           },
-          required: ['restaurantId', 'restaurantName', 'platform', 'date', 'partySize', 'preferredTimes', 'releaseTime'],
+          required: ['restaurantId', 'restaurantName', 'date', 'releaseTime'],
         },
       },
       {
         name: 'list_snipes',
-        description: 'List all scheduled and completed snipes',
+        description: 'List all scheduled and completed snipes. No parameters needed.',
         inputSchema: {
           type: 'object',
           properties: {},
@@ -77,29 +183,29 @@ function createServer(): Server {
       },
       {
         name: 'get_snipe',
-        description: 'Get details about a specific snipe',
+        description: 'Get details about a specific snipe by ID.',
         inputSchema: {
           type: 'object',
           properties: {
-            snipeId: { type: 'string', description: 'Snipe ID' },
+            snipeId: { type: 'string', description: 'The snipe ID returned when you created the snipe' },
           },
           required: ['snipeId'],
         },
       },
       {
         name: 'cancel_snipe',
-        description: 'Cancel a pending snipe',
+        description: 'Cancel a pending snipe by ID.',
         inputSchema: {
           type: 'object',
           properties: {
-            snipeId: { type: 'string', description: 'Snipe ID to cancel' },
+            snipeId: { type: 'string', description: 'The snipe ID to cancel' },
           },
           required: ['snipeId'],
         },
       },
       {
         name: 'check_auth_status',
-        description: 'Check if Resy authentication is valid',
+        description: 'Check if Resy authentication is working. No parameters needed.',
         inputSchema: {
           type: 'object',
           properties: {},
@@ -115,38 +221,62 @@ function createServer(): Server {
     try {
       switch (name) {
         case 'create_snipe': {
-          const input = createSnipeSchema.parse(args);
+          // Parse with flexible schema
+          const raw = createSnipeSchema.parse(args);
 
-          const releaseDate = new Date(input.releaseTime);
+          // Normalize all inputs
+          const restaurantId = parseRestaurantId(raw.restaurantId);
+          const date = parseDate(raw.date);
+          const releaseTime = parseReleaseTime(raw.releaseTime, date);
+          const platform = raw.platform || detectPlatform(raw.restaurantId);
+          const partySize = typeof raw.partySize === 'string' ? parseInt(raw.partySize, 10) : (raw.partySize || 2);
+          const preferredTimes = normalizePreferredTimes(raw.preferredTimes);
+
+          // Validate party size
+          if (partySize < 1 || partySize > 20) {
+            return {
+              content: [{ type: 'text', text: `Party size must be between 1 and 20. Got: ${partySize}` }],
+              isError: true,
+            };
+          }
+
+          // Check release time is in future
+          const releaseDate = new Date(releaseTime);
           if (releaseDate.getTime() < Date.now()) {
             return {
-              content: [{ type: 'text', text: JSON.stringify({ error: 'Release time must be in the future' }) }],
+              content: [{ type: 'text', text: `Release time must be in the future. Got: ${releaseTime} (${releaseDate.toLocaleString()})` }],
               isError: true,
             };
           }
 
           const snipe = await createSnipe({
-            restaurantId: input.restaurantId,
-            restaurantName: input.restaurantName,
-            date: input.date,
-            partySize: input.partySize,
-            preferredTimes: input.preferredTimes,
-            releaseTime: input.releaseTime,
+            restaurantId,
+            restaurantName: raw.restaurantName,
+            date,
+            partySize,
+            preferredTimes,
+            releaseTime,
           });
 
-          scheduleSnipe(snipe, input.platform);
+          scheduleSnipe(snipe, platform);
 
           return {
             content: [{
               type: 'text',
               text: JSON.stringify({
                 success: true,
-                snipe: {
-                  ...snipe,
-                  platform: input.platform,
-                  isScheduled: true,
+                message: `✅ Snipe scheduled!`,
+                details: {
+                  id: snipe.id,
+                  restaurant: raw.restaurantName,
+                  restaurantId,
+                  platform,
+                  date,
+                  partySize,
+                  preferredTimes,
+                  releaseTime: releaseDate.toLocaleString(),
                 },
-                message: `Snipe scheduled for ${input.restaurantName} on ${input.date}. Will attempt booking at ${input.releaseTime}`,
+                note: `The sniper will attempt to book at ${releaseDate.toLocaleString()} for ${preferredTimes.join(' or ')}.`
               }, null, 2),
             }],
           };
@@ -154,13 +284,23 @@ function createServer(): Server {
 
         case 'list_snipes': {
           const snipes = await listSnipes();
+          if (snipes.length === 0) {
+            return {
+              content: [{ type: 'text', text: 'No snipes scheduled. Use create_snipe to schedule one.' }],
+            };
+          }
           return {
             content: [{
               type: 'text',
               text: JSON.stringify({
+                count: snipes.length,
                 snipes: snipes.map(s => ({
-                  ...s,
+                  id: s.id,
+                  restaurant: s.restaurantName,
+                  date: s.date,
+                  status: s.status,
                   isScheduled: isSnipeScheduled(s.id),
+                  releaseTime: new Date(s.releaseTime).toLocaleString(),
                 })),
               }, null, 2),
             }],
@@ -173,7 +313,7 @@ function createServer(): Server {
 
           if (!snipe) {
             return {
-              content: [{ type: 'text', text: JSON.stringify({ error: 'Snipe not found' }) }],
+              content: [{ type: 'text', text: `Snipe not found with ID: ${snipeId}. Use list_snipes to see all snipes.` }],
               isError: true,
             };
           }
@@ -184,6 +324,7 @@ function createServer(): Server {
               text: JSON.stringify({
                 ...snipe,
                 isScheduled: isSnipeScheduled(snipe.id),
+                releaseTimeFormatted: new Date(snipe.releaseTime).toLocaleString(),
               }, null, 2),
             }],
           };
@@ -195,14 +336,14 @@ function createServer(): Server {
 
           if (!snipe) {
             return {
-              content: [{ type: 'text', text: JSON.stringify({ error: 'Snipe not found' }) }],
+              content: [{ type: 'text', text: `Snipe not found with ID: ${snipeId}. Use list_snipes to see all snipes.` }],
               isError: true,
             };
           }
 
           if (snipe.status !== 'pending') {
             return {
-              content: [{ type: 'text', text: JSON.stringify({ error: `Cannot cancel snipe with status: ${snipe.status}` }) }],
+              content: [{ type: 'text', text: `Cannot cancel snipe - status is "${snipe.status}". Only pending snipes can be cancelled.` }],
               isError: true,
             };
           }
@@ -212,10 +353,7 @@ function createServer(): Server {
           await deleteSnipe(snipeId);
 
           return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({ success: true, message: 'Snipe cancelled' }, null, 2),
-            }],
+            content: [{ type: 'text', text: `✅ Snipe cancelled for ${snipe.restaurantName} on ${snipe.date}.` }],
           };
         }
 
@@ -223,36 +361,38 @@ function createServer(): Server {
           try {
             await resyClient.ensureAuth();
             return {
-              content: [{ type: 'text', text: JSON.stringify({ authenticated: true }, null, 2) }],
+              content: [{ type: 'text', text: '✅ Resy authentication is working.' }],
             };
           } catch (error) {
             return {
               content: [{
                 type: 'text',
-                text: JSON.stringify({
-                  authenticated: false,
-                  error: error instanceof Error ? error.message : 'Unknown error',
-                }, null, 2),
+                text: `❌ Resy authentication failed: ${error instanceof Error ? error.message : 'Unknown error'}. Make sure RESY_EMAIL and RESY_PASSWORD are set.`,
               }],
+              isError: true,
             };
           }
         }
 
         default:
           return {
-            content: [{ type: 'text', text: `Unknown tool: ${name}` }],
+            content: [{ type: 'text', text: `Unknown tool: ${name}. Available: create_snipe, list_snipes, get_snipe, cancel_snipe, check_auth_status` }],
             isError: true,
           };
       }
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+
       if (error instanceof z.ZodError) {
+        const issues = error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
         return {
-          content: [{ type: 'text', text: `Invalid input: ${JSON.stringify(error.errors)}` }],
+          content: [{ type: 'text', text: `Invalid input: ${issues}` }],
           isError: true,
         };
       }
+
       return {
-        content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}` }],
+        content: [{ type: 'text', text: `Error: ${message}` }],
         isError: true,
       };
     }
@@ -285,35 +425,22 @@ app.get('/health', (_req, res) => {
 app.all('/mcp', express.json(), async (req, res) => {
   console.log(`[MCP] ${req.method} /mcp from:`, req.ip);
 
-  // Handle GET for SSE stream (session notifications)
   if (req.method === 'GET') {
     const sessionId = req.headers['mcp-session-id'] as string;
-    console.log('[MCP] GET request, session:', sessionId);
-
     if (!sessionId || !sessions.has(sessionId)) {
       res.status(400).json({ error: 'Invalid or missing session ID' });
       return;
     }
-
-    const session = sessions.get(sessionId)!;
-
-    // Set up SSE for notifications
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
-
-    req.on('close', () => {
-      console.log('[MCP] SSE connection closed for session:', sessionId);
-    });
+    req.on('close', () => sessions.delete(sessionId));
     return;
   }
 
-  // Handle DELETE for session termination
   if (req.method === 'DELETE') {
     const sessionId = req.headers['mcp-session-id'] as string;
-    console.log('[MCP] DELETE session:', sessionId);
-
     if (sessionId && sessions.has(sessionId)) {
       const session = sessions.get(sessionId)!;
       await session.server.close();
@@ -323,36 +450,26 @@ app.all('/mcp', express.json(), async (req, res) => {
     return;
   }
 
-  // Handle POST for messages
   if (req.method === 'POST') {
     let sessionId = req.headers['mcp-session-id'] as string;
-    console.log('[MCP] POST request, session:', sessionId, 'body:', JSON.stringify(req.body));
 
-    // Create new session if needed (for initialize request)
     if (!sessionId || !sessions.has(sessionId)) {
       sessionId = randomUUID();
-      console.log('[MCP] Creating new session:', sessionId);
-
       const server = createServer();
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => sessionId,
       });
-
       sessions.set(sessionId, { server, transport });
-
       await server.connect(transport);
-      console.log('[MCP] Server connected to transport');
     }
 
     const session = sessions.get(sessionId)!;
-
     try {
-      // Handle the request through the transport
       await session.transport.handleRequest(req, res, req.body);
     } catch (err) {
-      console.error('[MCP] Error handling request:', err);
+      console.error('[MCP] Error:', err);
       if (!res.headersSent) {
-        res.status(500).json({ error: 'Internal error', message: err instanceof Error ? err.message : 'Unknown' });
+        res.status(500).json({ error: 'Internal error' });
       }
     }
     return;
@@ -364,26 +481,19 @@ app.all('/mcp', express.json(), async (req, res) => {
 async function main() {
   console.log('[MCP Sniper] Starting Restaurant Sniper MCP Server...');
 
-  // Verify Resy credentials on startup
   try {
     await resyClient.ensureAuth();
     console.log('[MCP Sniper] Resy authentication successful');
   } catch (error) {
     console.warn('[MCP Sniper] Resy auth failed:', error instanceof Error ? error.message : error);
-    console.warn('[MCP Sniper] Set RESY_EMAIL and RESY_PASSWORD environment variables');
   }
 
-  // Load pending snipes from database
   await loadPendingSnipes();
 
   app.listen(PORT, () => {
     console.log(`[MCP Sniper] Listening on port ${PORT}`);
     console.log('[MCP Sniper] MCP endpoint: /mcp');
-    console.log('[MCP Sniper] Health check: /health');
   });
 }
 
-main().catch((error) => {
-  console.error('[MCP Sniper] Fatal error:', error);
-  process.exit(1);
-});
+main().catch(console.error);
