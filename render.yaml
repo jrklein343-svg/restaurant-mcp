@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: restaurant-sniper
+    runtime: node
+    region: oregon
+    plan: free
+    rootDir: sniper-service
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: RESY_EMAIL
+        sync: false
+      - key: RESY_PASSWORD
+        sync: false
+      - key: API_KEY
+        generateValue: true
+      - key: NOTIFICATION_WEBHOOK
+        sync: false
+      - key: NTFY_TOPIC
+        sync: false
+    disk:
+      name: sniper-data
+      mountPath: /data
+      sizeGB: 1

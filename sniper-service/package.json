@@ -1,0 +1,30 @@
+{
+  "name": "restaurant-sniper-service",
+  "version": "1.0.0",
+  "description": "24/7 Restaurant reservation sniper service for Resy",
+  "main": "dist/server.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsc --watch"
+  },
+  "keywords": ["restaurant", "resy", "sniper", "reservations"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "express": "^4.18.2",
+    "sql.js": "^1.10.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.10.0",
+    "@types/sql.js": "^1.4.9",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
