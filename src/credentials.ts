@@ -59,7 +59,23 @@ async function saveCredentials(store: CredentialStore): Promise<void> {
   await fs.writeFile(CRED_FILE, combined);
 }
 
+// Map credential keys to environment variable names
+const ENV_VAR_MAP: Record<CredentialKey, string> = {
+  'resy-api-key': 'API_KEY',
+  'resy-auth-token': 'RESY_AUTH_TOKEN',
+  'resy-email': 'RESY_EMAIL',
+  'resy-password': 'RESY_PASSWORD',
+  'opentable-token': 'OPENTABLE_TOKEN',
+};
+
 export async function getCredential(key: CredentialKey): Promise<string | null> {
+  // First check environment variables (for cloud deployments)
+  const envVar = ENV_VAR_MAP[key];
+  if (envVar && process.env[envVar]) {
+    return process.env[envVar] as string;
+  }
+
+  // Fall back to encrypted file storage
   const store = await loadCredentials();
   return store[key] || null;
 }
