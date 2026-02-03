@@ -210,7 +210,7 @@ The slotId comes from check_availability results.`,
                   rating: x.rating,
                   platform: 'resy',
                 })))
-                .catch((e) => errors.push(`Resy: ${e.message}`))
+                .catch((e) => { errors.push(`Resy: ${e.message}`); })
             );
           }
 
@@ -227,7 +227,7 @@ The slotId comes from check_availability results.`,
                   rating: x.rating,
                   platform: 'opentable',
                 })))
-                .catch((e) => errors.push(`OpenTable: ${e.message}`))
+                .catch((e) => { errors.push(`OpenTable: ${e.message}`); })
             );
           }
 
