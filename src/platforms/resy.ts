@@ -334,7 +334,14 @@ export class ResyPlatformClient extends BasePlatformClient {
       const available = response.status === 200;
       cache.set(cacheKey, available, CacheTTL.PLATFORM_HEALTH);
       return available;
-    } catch {
+    } catch (error) {
+      console.error('Resy isAvailable error:', error instanceof Error ? error.message : error);
+      if (error instanceof AxiosError) {
+        console.error('Resy API error details:', {
+          status: error.response?.status,
+          data: error.response?.data,
+        });
+      }
       cache.set(cacheKey, false, CacheTTL.PLATFORM_HEALTH);
       return false;
     }

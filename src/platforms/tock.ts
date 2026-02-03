@@ -209,7 +209,8 @@ export class TockPlatformClient extends BasePlatformClient {
       const available = response.status === 200;
       cache.set(cacheKey, available, CacheTTL.PLATFORM_HEALTH);
       return available;
-    } catch {
+    } catch (error) {
+      console.error('Tock isAvailable error:', error instanceof Error ? error.message : error);
       cache.set(cacheKey, false, CacheTTL.PLATFORM_HEALTH);
       return false;
     }
