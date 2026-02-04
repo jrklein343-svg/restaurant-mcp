@@ -214,20 +214,67 @@ export class ResyPlatformClient extends BasePlatformClient {
     const date = query.date || this.today();
     const partySize = query.partySize || 2;
 
+    // Get approximate coordinates for major cities
+    const coords = this.getCityCoordinates(query.location);
+
     try {
       const data = await this.request<ResyFindResponse>('get', '/4/find', {
-        lat: 0,
-        long: 0,
+        lat: coords.lat,
+        long: coords.lng,
         day: date,
         party_size: partySize,
-        query: `${query.query} ${query.location}`.trim(),
+        query: query.query,
       });
 
+      console.log(`Resy search for "${query.query}" in "${query.location}": ${data.search?.hits?.length || 0} results`);
       return (data.search?.hits || []).map((hit) => this.mapToRestaurant(hit));
     } catch (error) {
       console.error('Resy search error:', error);
       return [];
     }
+  }
+
+  private getCityCoordinates(location: string): { lat: number; lng: number } {
+    const locationLower = location.toLowerCase();
+
+    // Common city coordinates
+    const cities: Record<string, { lat: number; lng: number }> = {
+      'new york': { lat: 40.7128, lng: -73.9352 },
+      'nyc': { lat: 40.7128, lng: -73.9352 },
+      'manhattan': { lat: 40.7831, lng: -73.9712 },
+      'brooklyn': { lat: 40.6782, lng: -73.9442 },
+      'los angeles': { lat: 34.0522, lng: -118.2437 },
+      'la': { lat: 34.0522, lng: -118.2437 },
+      'chicago': { lat: 41.8781, lng: -87.6298 },
+      'san francisco': { lat: 37.7749, lng: -122.4194 },
+      'sf': { lat: 37.7749, lng: -122.4194 },
+      'miami': { lat: 25.7617, lng: -80.1918 },
+      'austin': { lat: 30.2672, lng: -97.7431 },
+      'seattle': { lat: 47.6062, lng: -122.3321 },
+      'boston': { lat: 42.3601, lng: -71.0589 },
+      'denver': { lat: 39.7392, lng: -104.9903 },
+      'atlanta': { lat: 33.7490, lng: -84.3880 },
+      'dallas': { lat: 32.7767, lng: -96.7970 },
+      'houston': { lat: 29.7604, lng: -95.3698 },
+      'philadelphia': { lat: 39.9526, lng: -75.1652 },
+      'washington': { lat: 38.9072, lng: -77.0369 },
+      'dc': { lat: 38.9072, lng: -77.0369 },
+      'las vegas': { lat: 36.1699, lng: -115.1398 },
+      'vegas': { lat: 36.1699, lng: -115.1398 },
+      'nashville': { lat: 36.1627, lng: -86.7816 },
+      'portland': { lat: 45.5152, lng: -122.6784 },
+      'san diego': { lat: 32.7157, lng: -117.1611 },
+    };
+
+    // Check if location matches any known city
+    for (const [city, coords] of Object.entries(cities)) {
+      if (locationLower.includes(city)) {
+        return coords;
+      }
+    }
+
+    // Default to New York if no match
+    return { lat: 40.7128, lng: -73.9352 };
   }
 
   async getDetails(id: string | number): Promise<RestaurantDetails | null> {
