@@ -334,7 +334,7 @@ export class ResyPlatformClient extends BasePlatformClient {
       // Simple health check - use venue endpoint which is faster
       const response = await this.client.get('/3/venue', {
         headers: this.getHeaders(),
-        params: { url_slug: 'carbone-new-york', location: 'new-york-ny' },
+        params: { url_slug: 'american-beauty-at-the-grove', location: 'los-angeles-ca' },
         timeout: 15000,
       });
       const available = response.status === 200;
