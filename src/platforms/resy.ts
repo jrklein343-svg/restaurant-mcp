@@ -199,7 +199,9 @@ export class ResyPlatformClient extends BasePlatformClient {
 
       return response.data;
     } catch (error) {
-      if (error instanceof AxiosError && error.response?.status === 401 && retry) {
+      // Handle both 401 and 419 as auth errors
+      if (error instanceof AxiosError && (error.response?.status === 401 || error.response?.status === 419) && retry) {
+        console.log(`Resy auth error (${error.response?.status}), attempting token refresh...`);
         const refreshed = await this.refreshToken();
         if (refreshed) {
           return this.request<T>(method, url, data, false);
@@ -221,12 +223,11 @@ export class ResyPlatformClient extends BasePlatformClient {
     const startTime = Date.now();
 
     try {
-      const data = await this.request<ResyFindResponse>('get', '/4/find', {
-        lat: coords.lat,
-        long: coords.lng,
-        day: date,
-        party_size: partySize,
+      // Use the faster /3/venuesearch/search endpoint
+      const data = await this.request<ResyFindResponse>('post', '/3/venuesearch/search', {
+        geo: JSON.stringify({ latitude: coords.lat, longitude: coords.lng }),
         query: query.query,
+        types: JSON.stringify(['venue']),
       });
 
       const elapsed = Date.now() - startTime;
@@ -235,7 +236,24 @@ export class ResyPlatformClient extends BasePlatformClient {
     } catch (error) {
       const elapsed = Date.now() - startTime;
       console.error(`Resy search failed after ${elapsed}ms:`, error instanceof Error ? error.message : error);
-      return [];
+
+      // Fallback: try the /4/find endpoint
+      console.log('Trying fallback /4/find endpoint...');
+      try {
+        const fallbackData = await this.request<ResyFindResponse>('get', '/4/find', {
+          lat: coords.lat,
+          long: coords.lng,
+          day: date,
+          party_size: partySize,
+          query: query.query,
+        });
+        const fallbackElapsed = Date.now() - startTime;
+        console.log(`Resy fallback search completed in ${fallbackElapsed}ms: ${fallbackData.search?.hits?.length || 0} results`);
+        return (fallbackData.search?.hits || []).map((hit) => this.mapToRestaurant(hit));
+      } catch (fallbackError) {
+        console.error('Resy fallback search also failed:', fallbackError instanceof Error ? fallbackError.message : fallbackError);
+        return [];
+      }
     }
   }
 
