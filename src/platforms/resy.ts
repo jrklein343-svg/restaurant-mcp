@@ -216,45 +216,132 @@ export class ResyPlatformClient extends BasePlatformClient {
     const date = query.date || this.today();
     const partySize = query.partySize || 2;
 
-    // Get approximate coordinates for major cities
-    const coords = this.getCityCoordinates(query.location);
+    // Get location info for slug
+    const locationSlug = this.getLocationSlug(query.location);
 
-    console.log(`Resy search starting: "${query.query}" in "${query.location}" (${coords.lat}, ${coords.lng}) for ${date}`);
+    console.log(`Resy search starting: "${query.query}" in "${query.location}" (${locationSlug})`);
     const startTime = Date.now();
 
+    // Try direct venue lookup first (fast, reliable)
     try {
-      // Use the faster /3/venuesearch/search endpoint
-      const data = await this.request<ResyFindResponse>('post', '/3/venuesearch/search', {
-        geo: JSON.stringify({ latitude: coords.lat, longitude: coords.lng }),
-        query: query.query,
-        types: JSON.stringify(['venue']),
+      const venueSlug = this.nameToSlug(query.query, query.location);
+      console.log(`Trying direct venue lookup with slug: ${venueSlug}`);
+
+      const venueData = await this.client.get<ResyVenueDetailsResponse>('/3/venue', {
+        headers: this.getHeaders(),
+        params: { url_slug: venueSlug, location: locationSlug },
+        timeout: 10000,
       });
 
-      const elapsed = Date.now() - startTime;
-      console.log(`Resy search completed in ${elapsed}ms: ${data.search?.hits?.length || 0} results`);
-      return (data.search?.hits || []).map((hit) => this.mapToRestaurant(hit));
-    } catch (error) {
-      const elapsed = Date.now() - startTime;
-      console.error(`Resy search failed after ${elapsed}ms:`, error instanceof Error ? error.message : error);
+      if (venueData.data?.id?.resy) {
+        const elapsed = Date.now() - startTime;
+        console.log(`Resy direct lookup succeeded in ${elapsed}ms`);
 
-      // Fallback: try the /4/find endpoint
-      console.log('Trying fallback /4/find endpoint...');
-      try {
-        const fallbackData = await this.request<ResyFindResponse>('get', '/4/find', {
+        // Convert to ResyVenueHit format
+        const hit: ResyVenueHit = {
+          id: { resy: venueData.data.id.resy },
+          name: venueData.data.name,
+          location: {
+            name: venueData.data.location.name,
+            neighborhood: venueData.data.location.neighborhood,
+            time_zone: venueData.data.location.time_zone,
+          },
+          cuisine: venueData.data.cuisine,
+          price_range: venueData.data.price_range,
+          rating: venueData.data.rating,
+          images: venueData.data.images,
+        };
+        return [this.mapToRestaurant(hit)];
+      }
+    } catch (directError) {
+      const elapsed = Date.now() - startTime;
+      console.log(`Direct lookup failed after ${elapsed}ms:`, directError instanceof Error ? directError.message : 'unknown');
+    }
+
+    // Fallback: try /4/find with short timeout
+    console.log('Trying /4/find search...');
+    const coords = this.getCityCoordinates(query.location);
+
+    try {
+      const findData = await this.client.get<ResyFindResponse>('/4/find', {
+        headers: this.getHeaders(),
+        params: {
           lat: coords.lat,
           long: coords.lng,
           day: date,
           party_size: partySize,
           query: query.query,
-        });
-        const fallbackElapsed = Date.now() - startTime;
-        console.log(`Resy fallback search completed in ${fallbackElapsed}ms: ${fallbackData.search?.hits?.length || 0} results`);
-        return (fallbackData.search?.hits || []).map((hit) => this.mapToRestaurant(hit));
-      } catch (fallbackError) {
-        console.error('Resy fallback search also failed:', fallbackError instanceof Error ? fallbackError.message : fallbackError);
-        return [];
+        },
+        timeout: 10000, // Short timeout
+      });
+
+      const elapsed = Date.now() - startTime;
+      console.log(`Resy /4/find completed in ${elapsed}ms: ${findData.data?.search?.hits?.length || 0} results`);
+      return (findData.data?.search?.hits || []).map((hit) => this.mapToRestaurant(hit));
+    } catch (findError) {
+      const elapsed = Date.now() - startTime;
+      console.error(`Resy search failed after ${elapsed}ms:`, findError instanceof Error ? findError.message : findError);
+      return [];
+    }
+  }
+
+  private nameToSlug(name: string, location: string): string {
+    // Convert restaurant name to URL slug format
+    // e.g., "Carbone" + "New York" -> "carbone-new-york"
+    const nameSlug = name.toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .trim();
+
+    const locationPart = location.toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .trim();
+
+    return `${nameSlug}-${locationPart}`;
+  }
+
+  private getLocationSlug(location: string): string {
+    const locationLower = location.toLowerCase();
+
+    const locationSlugs: Record<string, string> = {
+      'new york': 'new-york-ny',
+      'nyc': 'new-york-ny',
+      'manhattan': 'new-york-ny',
+      'brooklyn': 'new-york-ny',
+      'los angeles': 'los-angeles-ca',
+      'la': 'los-angeles-ca',
+      'chicago': 'chicago-il',
+      'san francisco': 'san-francisco-ca',
+      'sf': 'san-francisco-ca',
+      'miami': 'miami-fl',
+      'austin': 'austin-tx',
+      'seattle': 'seattle-wa',
+      'boston': 'boston-ma',
+      'denver': 'denver-co',
+      'atlanta': 'atlanta-ga',
+      'dallas': 'dallas-tx',
+      'houston': 'houston-tx',
+      'philadelphia': 'philadelphia-pa',
+      'washington': 'washington-dc',
+      'dc': 'washington-dc',
+      'las vegas': 'las-vegas-nv',
+      'vegas': 'las-vegas-nv',
+      'nashville': 'nashville-tn',
+      'portland': 'portland-or',
+      'san diego': 'san-diego-ca',
+    };
+
+    for (const [city, slug] of Object.entries(locationSlugs)) {
+      if (locationLower.includes(city)) {
+        return slug;
       }
     }
+
+    // Default: convert location to slug format
+    return locationLower.replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-');
   }
 
   private getCityCoordinates(location: string): { lat: number; lng: number } {
