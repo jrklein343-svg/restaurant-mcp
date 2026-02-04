@@ -285,22 +285,16 @@ export class ResyPlatformClient extends BasePlatformClient {
     }
   }
 
-  private nameToSlug(name: string, location: string): string {
+  private nameToSlug(name: string, _location: string): string {
     // Convert restaurant name to URL slug format
-    // e.g., "Carbone" + "New York" -> "carbone-new-york"
-    const nameSlug = name.toLowerCase()
+    // Resy uses just the restaurant name, not location
+    // e.g., "Carbone" -> "carbone", "The Grill" -> "the-grill"
+    return name.toLowerCase()
       .replace(/[^a-z0-9\s-]/g, '')
       .replace(/\s+/g, '-')
       .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '') // Remove leading/trailing dashes
       .trim();
-
-    const locationPart = location.toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, '')
-      .replace(/\s+/g, '-')
-      .replace(/-+/g, '-')
-      .trim();
-
-    return `${nameSlug}-${locationPart}`;
   }
 
   private getLocationSlug(location: string): string {
