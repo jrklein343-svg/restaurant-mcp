@@ -113,7 +113,7 @@ export class ResyPlatformClient extends BasePlatformClient {
     super();
     this.client = axios.create({
       baseURL: BASE_URL,
-      timeout: 30000,
+      timeout: 15000, // 15 second timeout
     });
   }
 
@@ -217,6 +217,9 @@ export class ResyPlatformClient extends BasePlatformClient {
     // Get approximate coordinates for major cities
     const coords = this.getCityCoordinates(query.location);
 
+    console.log(`Resy search starting: "${query.query}" in "${query.location}" (${coords.lat}, ${coords.lng}) for ${date}`);
+    const startTime = Date.now();
+
     try {
       const data = await this.request<ResyFindResponse>('get', '/4/find', {
         lat: coords.lat,
@@ -226,10 +229,12 @@ export class ResyPlatformClient extends BasePlatformClient {
         query: query.query,
       });
 
-      console.log(`Resy search for "${query.query}" in "${query.location}": ${data.search?.hits?.length || 0} results`);
+      const elapsed = Date.now() - startTime;
+      console.log(`Resy search completed in ${elapsed}ms: ${data.search?.hits?.length || 0} results`);
       return (data.search?.hits || []).map((hit) => this.mapToRestaurant(hit));
     } catch (error) {
-      console.error('Resy search error:', error);
+      const elapsed = Date.now() - startTime;
+      console.error(`Resy search failed after ${elapsed}ms:`, error instanceof Error ? error.message : error);
       return [];
     }
   }
