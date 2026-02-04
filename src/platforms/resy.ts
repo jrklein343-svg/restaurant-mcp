@@ -132,12 +132,18 @@ export class ResyPlatformClient extends BasePlatformClient {
   private getHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/x-www-form-urlencoded',
+      'Accept': 'application/json, text/plain, */*',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
+      'Origin': 'https://resy.com',
+      'Referer': 'https://resy.com/',
+      'x-origin': 'https://resy.com',
     };
     if (this.apiKey) {
       headers['Authorization'] = `ResyAPI api_key="${this.apiKey}"`;
     }
     if (this.authToken) {
       headers['x-resy-auth-token'] = this.authToken;
+      headers['x-resy-universal-auth'] = this.authToken;
     }
     return headers;
   }
