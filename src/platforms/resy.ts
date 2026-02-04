@@ -331,21 +331,22 @@ export class ResyPlatformClient extends BasePlatformClient {
 
     try {
       await this.ensureCredentials();
-      // Simple health check - try to search
-      const response = await this.client.get('/4/find', {
+      // Simple health check - use venue endpoint which is faster
+      const response = await this.client.get('/3/venue', {
         headers: this.getHeaders(),
-        params: { lat: 40.7128, long: -74.006, day: this.today(), party_size: 2, query: 'test' },
-        timeout: 5000,
+        params: { url_slug: 'carbone-new-york', location: 'new-york-ny' },
+        timeout: 15000,
       });
       const available = response.status === 200;
       cache.set(cacheKey, available, CacheTTL.PLATFORM_HEALTH);
+      console.log('Resy isAvailable: SUCCESS');
       return available;
     } catch (error) {
       console.error('Resy isAvailable error:', error instanceof Error ? error.message : error);
       if (error instanceof AxiosError) {
         console.error('Resy API error details:', {
           status: error.response?.status,
-          data: error.response?.data,
+          data: typeof error.response?.data === 'string' ? error.response.data.substring(0, 200) : error.response?.data,
         });
       }
       cache.set(cacheKey, false, CacheTTL.PLATFORM_HEALTH);
