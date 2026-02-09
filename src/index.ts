@@ -752,11 +752,18 @@ function requireApiKey(req: express.Request, res: express.Response, next: expres
 }
 
 // Poke doesn't send Accept: text/event-stream, but the MCP SDK requires it.
-// Ensure it's present before the transport processes the request.
+// Patch both req.headers and req.rawHeaders since @hono/node-server reads rawHeaders.
 function ensureMcpAcceptHeader(req: express.Request, _res: express.Response, next: express.NextFunction) {
   const accept = req.headers['accept'] || '';
   if (!accept.includes('text/event-stream')) {
-    req.headers['accept'] = 'application/json, text/event-stream';
+    const newAccept = 'application/json, text/event-stream';
+    req.headers['accept'] = newAccept;
+    const idx = req.rawHeaders.findIndex((h: string) => h.toLowerCase() === 'accept');
+    if (idx !== -1) {
+      req.rawHeaders[idx + 1] = newAccept;
+    } else {
+      req.rawHeaders.push('Accept', newAccept);
+    }
   }
   next();
 }
