@@ -5,7 +5,8 @@
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "echo 'dist pre-compiled'",
+    "build:local": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc --watch"
   },

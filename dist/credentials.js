@@ -1,0 +1,115 @@
+import { promises as fs } from 'fs';
+import { homedir } from 'os';
+import { join } from 'path';
+import * as crypto from 'crypto';
+const CRED_DIR = join(homedir(), '.restaurant-mcp');
+const CRED_FILE = join(CRED_DIR, 'credentials.enc');
+// Use machine-specific key derivation for basic protection
+// Note: For stronger security on Windows, consider using node-dpapi or keytar with proper native setup
+function getEncryptionKey() {
+    const machineId = `${homedir()}-restaurant-mcp-v1`;
+    return crypto.scryptSync(machineId, 'restaurant-mcp-salt', 32);
+}
+async function loadCredentials() {
+    try {
+        await fs.mkdir(CRED_DIR, { recursive: true });
+        const encrypted = await fs.readFile(CRED_FILE);
+        const iv = encrypted.subarray(0, 16);
+        const authTag = encrypted.subarray(16, 32);
+        const data = encrypted.subarray(32);
+        const key = getEncryptionKey();
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+        decipher.setAuthTag(authTag);
+        const decrypted = Buffer.concat([decipher.update(data), decipher.final()]);
+        return JSON.parse(decrypted.toString('utf8'));
+    }
+    catch {
+        return {};
+    }
+}
+async function saveCredentials(store) {
+    await fs.mkdir(CRED_DIR, { recursive: true });
+    const key = getEncryptionKey();
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const data = JSON.stringify(store);
+    const encrypted = Buffer.concat([cipher.update(data, 'utf8'), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    const combined = Buffer.concat([iv, authTag, encrypted]);
+    await fs.writeFile(CRED_FILE, combined);
+}
+// Map credential keys to environment variable names
+const ENV_VAR_MAP = {
+    'resy-api-key': 'API_KEY',
+    'resy-auth-token': 'RESY_AUTH_TOKEN',
+    'resy-email': 'RESY_EMAIL',
+    'resy-password': 'RESY_PASSWORD',
+    'opentable-token': 'OPENTABLE_TOKEN',
+};
+export async function getCredential(key) {
+    // First check environment variables (for cloud deployments)
+    const envVar = ENV_VAR_MAP[key];
+    if (envVar && process.env[envVar]) {
+        return process.env[envVar];
+    }
+    // Fall back to encrypted file storage
+    const store = await loadCredentials();
+    return store[key] || null;
+}
+export async function setCredential(key, value) {
+    const store = await loadCredentials();
+    store[key] = value;
+    await saveCredentials(store);
+}
+export async function deleteCredential(key) {
+    const store = await loadCredentials();
+    if (key in store) {
+        delete store[key];
+        await saveCredentials(store);
+        return true;
+    }
+    return false;
+}
+export async function getAllCredentialKeys() {
+    const store = await loadCredentials();
+    return Object.keys(store);
+}
+export function maskCredential(value) {
+    if (value.length <= 4) {
+        return '*'.repeat(value.length);
+    }
+    return value.slice(0, 2) + '*'.repeat(value.length - 4) + value.slice(-2);
+}
+export function maskEmail(email) {
+    const [local, domain] = email.split('@');
+    if (!domain)
+        return maskCredential(email);
+    const maskedLocal = local.length <= 2
+        ? '*'.repeat(local.length)
+        : local[0] + '*'.repeat(local.length - 2) + local[local.length - 1];
+    return `${maskedLocal}@${domain}`;
+}
+export async function getResyAuthStatus() {
+    const [apiKey, authToken, email, password] = await Promise.all([
+        getCredential('resy-api-key'),
+        getCredential('resy-auth-token'),
+        getCredential('resy-email'),
+        getCredential('resy-password'),
+    ]);
+    return {
+        platform: 'resy',
+        hasApiKey: !!apiKey,
+        hasAuthToken: !!authToken,
+        hasLogin: !!email && !!password,
+        email: email ? maskEmail(email) : undefined,
+    };
+}
+export async function getOpenTableAuthStatus() {
+    const token = await getCredential('opentable-token');
+    return {
+        platform: 'opentable',
+        hasApiKey: false,
+        hasAuthToken: !!token,
+        hasLogin: false,
+    };
+}
