@@ -695,6 +695,15 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '1mb' }));
 
+// Log all /mcp requests for debugging
+app.use('/mcp', (req, _res, next) => {
+  console.log(`[MCP] ${req.method} /mcp Accept: ${req.headers['accept']} Auth: ${req.headers['authorization'] ? 'Bearer ***' : 'none'} Content-Type: ${req.headers['content-type']}`);
+  if (req.method === 'POST' && req.body) {
+    console.log(`[MCP] Body method: ${req.body?.method}`);
+  }
+  next();
+});
+
 // Health check
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'restaurant-mcp', version: '2.0.0' });
