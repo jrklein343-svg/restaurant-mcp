@@ -739,7 +739,17 @@ const httpTransport = new StreamableHTTPServerTransport({
   sessionIdGenerator: undefined,
 });
 
-app.post('/mcp', async (req, res) => {
+// Poke doesn't send Accept: text/event-stream, but the MCP SDK requires it.
+// Ensure it's present before the transport processes the request.
+function ensureMcpAcceptHeader(req: express.Request, _res: express.Response, next: express.NextFunction) {
+  const accept = req.headers['accept'] || '';
+  if (!accept.includes('text/event-stream')) {
+    req.headers['accept'] = 'application/json, text/event-stream';
+  }
+  next();
+}
+
+app.post('/mcp', ensureMcpAcceptHeader, async (req, res) => {
   try {
     await httpTransport.handleRequest(req, res, req.body);
   } catch (err) {
@@ -750,7 +760,7 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
-app.get('/mcp', async (req, res) => {
+app.get('/mcp', ensureMcpAcceptHeader, async (req, res) => {
   try {
     await httpTransport.handleRequest(req, res);
   } catch (err) {
@@ -761,7 +771,7 @@ app.get('/mcp', async (req, res) => {
   }
 });
 
-app.delete('/mcp', async (req, res) => {
+app.delete('/mcp', ensureMcpAcceptHeader, async (req, res) => {
   try {
     await httpTransport.handleRequest(req, res);
   } catch (err) {
