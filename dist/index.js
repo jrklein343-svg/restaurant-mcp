@@ -1,7 +1,5 @@
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { CallToolRequestSchema, ListToolsRequestSchema, isInitializeRequest, } from '@modelcontextprotocol/sdk/types.js';
-import crypto from 'crypto';
 import express from 'express';
 import { z } from 'zod';
 import { setCredential, getCredential, getResyAuthStatus, getOpenTableAuthStatus, } from './credentials.js';
@@ -70,502 +68,165 @@ const checkAuthStatusSchema = z.object({
 const refreshTokenSchema = z.object({
     platform: z.enum(['resy']).describe('Platform to refresh token for'),
 });
-const sessions = new Map();
-const SESSION_TTL_MS = 30 * 60 * 1000;
-// Clean up stale sessions
-setInterval(() => {
-    const now = Date.now();
-    for (const [id, s] of sessions.entries()) {
-        if (now - s.lastSeen > SESSION_TTL_MS) {
-            try {
-                s.transport.close?.();
-            }
-            catch { }
-            sessions.delete(id);
-        }
-    }
-}, 60_000).unref();
-function createMcpServer() {
-    const s = new Server({ name: 'restaurant-reservations', version: '2.0.0' }, { capabilities: { tools: {} } });
-    s.setRequestHandler(ListToolsRequestSchema, listToolsHandler);
-    s.setRequestHandler(CallToolRequestSchema, callToolHandler);
-    return s;
-}
-function createSession() {
-    const sessionId = crypto.randomUUID();
-    const server = createMcpServer();
-    const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => sessionId,
+function registerTools(server) {
+    server.tool('find_table', 'Find and book a table at a restaurant.', findTableSchema.shape, async (args) => {
+        const input = findTableSchema.parse(args);
+        const result = await findTable(input.restaurant, input.location, input.date, input.time, input.party_size, input.book);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     });
-    return { sessionId, session: { server, transport, lastSeen: Date.now() } };
+    server.tool('search_restaurant', 'Search for a restaurant by name and location.', searchRestaurantSchema.shape, async (args) => {
+        const input = searchRestaurantSchema.parse(args);
+        const result = await searchRestaurant(input.name, input.location, input.date, input.party_size);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    });
+    server.tool('get_restaurant', 'Look up a restaurant by its platform-specific ID.', getRestaurantSchema.shape, async (args) => {
+        const input = getRestaurantSchema.parse(args);
+        const result = await getRestaurantById(input.restaurant_id);
+        if (result.error || !result.restaurant) {
+            return { content: [{ type: 'text', text: JSON.stringify({ error: result.error || 'Restaurant not found' }, null, 2) }] };
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(result.restaurant, null, 2) }] };
+    });
+    server.tool('get_restaurants', 'Look up multiple restaurants by their IDs.', getRestaurantsSchema.shape, async (args) => {
+        const input = getRestaurantsSchema.parse(args);
+        const results = await getRestaurantsByIds(input.restaurant_ids);
+        const output = results.map((r) => ({ id: r.restaurant?.id, name: r.restaurant?.name, platform: r.platform, found: r.restaurant !== null, error: r.error, details: r.restaurant }));
+        return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }] };
+    });
+    server.tool('check_availability', 'Get available time slots for a restaurant on a given date.', checkAvailabilitySchema.shape, async (args) => {
+        const input = checkAvailabilitySchema.parse(args);
+        const result = await checkAvailability(input.restaurant_id, input.date, input.party_size);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    });
+    server.tool('make_reservation', 'Book a reservation.', makeReservationSchema.shape, async (args) => {
+        const input = makeReservationSchema.parse(args);
+        const parsed = parseRestaurantId(input.restaurant_id);
+        if (!parsed) return { content: [{ type: 'text', text: `Invalid restaurant ID: ${input.restaurant_id}` }] };
+        const client = getPlatformClient(parsed.platform);
+        const params = { restaurantId: input.restaurant_id, platform: parsed.platform, slotId: input.slot_id, date: input.date, partySize: input.party_size };
+        const result = await client.makeReservation(params);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    });
+    server.tool('get_booking_options', 'Get all ways to book a restaurant.', getBookingOptionsSchema.shape, async (args) => {
+        const input = getBookingOptionsSchema.parse(args);
+        const options = await getBookingOptions(input.restaurant_id);
+        return { content: [{ type: 'text', text: JSON.stringify(options, null, 2) }] };
+    });
+    server.tool('list_reservations', 'View your upcoming reservations.', listReservationsSchema.shape, async (args) => {
+        const input = listReservationsSchema.parse(args);
+        const results = [];
+        if (input.platform === 'resy' || input.platform === 'all') {
+            try {
+                const resyReservations = await resyClient.getReservations();
+                for (const r of resyReservations) {
+                    results.push({ platform: 'resy', reservationId: r.reservationId, restaurantName: r.venue.name, location: r.venue.location, date: r.date, time: r.time, partySize: r.partySize, status: r.status });
+                }
+            } catch {}
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+    });
+    server.tool('cancel_reservation', 'Cancel an existing reservation.', cancelReservationSchema.shape, async (args) => {
+        const input = cancelReservationSchema.parse(args);
+        if (input.platform === 'resy') {
+            try {
+                await resyClient.cancelReservation(input.reservation_id);
+                return { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Reservation cancelled successfully' }, null, 2) }] };
+            } catch (error) {
+                return { content: [{ type: 'text', text: JSON.stringify({ success: false, message: error instanceof Error ? error.message : 'Failed to cancel' }, null, 2) }] };
+            }
+        }
+        return { content: [{ type: 'text', text: JSON.stringify({ success: false, message: `${input.platform} reservations must be cancelled on their website` }, null, 2) }] };
+    });
+    server.tool('set_credentials', 'Securely store API credentials.', setCredentialsSchema.shape, async (args) => {
+        const input = setCredentialsSchema.parse(args);
+        const stored = [];
+        if (input.platform === 'resy') {
+            if (input.api_key) { await setCredential('resy-api-key', input.api_key); stored.push('API key'); }
+            if (input.auth_token) { await setCredential('resy-auth-token', input.auth_token); stored.push('auth token'); }
+        } else {
+            if (input.auth_token) { await setCredential('opentable-token', input.auth_token); stored.push('auth token'); }
+        }
+        return { content: [{ type: 'text', text: stored.length > 0 ? `Stored ${stored.join(' and ')} for ${input.platform}.` : 'No credentials provided to store.' }] };
+    });
+    server.tool('set_login', 'Store email/password for automatic token refresh.', setLoginSchema.shape, async (args) => {
+        const input = setLoginSchema.parse(args);
+        if (input.platform === 'resy') {
+            try {
+                await resyClient.login(input.email, input.password);
+                return { content: [{ type: 'text', text: 'Login successful! Token will auto-refresh when needed.' }] };
+            } catch (error) {
+                return { content: [{ type: 'text', text: `Login failed: ${error instanceof Error ? error.message : 'Invalid credentials'}` }] };
+            }
+        }
+        return { content: [{ type: 'text', text: 'Only Resy login is currently supported.' }] };
+    });
+    server.tool('check_auth_status', 'Check if credentials are configured and valid.', checkAuthStatusSchema.shape, async (args) => {
+        const input = checkAuthStatusSchema.parse(args);
+        const statuses = [];
+        if (input.platform === 'resy' || input.platform === 'all') {
+            const status = await getResyAuthStatus();
+            const isValid = status.hasAuthToken ? await resyClient.isAuthenticated() : false;
+            statuses.push({ ...status, isValid });
+        }
+        if (input.platform === 'opentable' || input.platform === 'all') {
+            const status = await getOpenTableAuthStatus();
+            statuses.push({ ...status, isValid: true });
+        }
+        if (input.platform === 'tock' || input.platform === 'all') {
+            statuses.push({ platform: 'tock', hasApiKey: false, hasAuthToken: false, hasLogin: false, isValid: true });
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(statuses, null, 2) }] };
+    });
+    server.tool('refresh_token', 'Manually refresh authentication token.', refreshTokenSchema.shape, async (args) => {
+        const input = refreshTokenSchema.parse(args);
+        if (input.platform === 'resy') {
+            const email = await getCredential('resy-email');
+            const password = await getCredential('resy-password');
+            if (!email || !password) return { content: [{ type: 'text', text: 'No login credentials stored. Use set_login first.' }] };
+            try {
+                await resyClient.login(email, password);
+                return { content: [{ type: 'text', text: 'Token refreshed successfully!' }] };
+            } catch (error) {
+                return { content: [{ type: 'text', text: `Token refresh failed: ${error instanceof Error ? error.message : 'Unknown error'}` }] };
+            }
+        }
+        return { content: [{ type: 'text', text: 'Only Resy token refresh is supported.' }] };
+    });
+    server.tool('snipe_reservation', 'Schedule an automatic booking attempt.', snipeReservationSchema.shape, async (args) => {
+        const input = snipeReservationSchema.parse(args);
+        const result = await snipeReservation(input);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    });
+    server.tool('list_snipes', 'View all scheduled snipe attempts.', listSnipesSchema.shape, async (args) => {
+        const input = listSnipesSchema.parse(args);
+        const results = await listScheduledSnipes(input);
+        return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+    });
+    server.tool('cancel_snipe', 'Cancel a scheduled snipe attempt.', cancelSnipeSchema.shape, async (args) => {
+        const input = cancelSnipeSchema.parse(args);
+        const result = await cancelSnipe(input);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    });
+    server.tool('get_platform_status', 'Check health and rate limit status of all platforms.', {}, async () => {
+        const health = await getPlatformHealth();
+        const rateLimits = rateLimiter.getAllStatus();
+        const cacheStats = cache.stats();
+        const status = { platforms: Object.entries(health).map(([platform, available]) => ({ platform, available, rateLimit: rateLimits.find((r) => r.platform === platform) })), cache: cacheStats };
+        return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
+    });
 }
-// Tool definitions
-const tools = [
-    {
-        name: 'find_table',
-        description: 'Find and book a table at a restaurant. Searches by name, checks availability for your date/time/party size, and books the best matching slot. Returns confirmation or booking URL.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                restaurant: { type: 'string', description: 'Restaurant name (e.g., "Carbone", "The Grill")' },
-                location: { type: 'string', description: 'City or neighborhood (e.g., "New York", "Manhattan")' },
-                date: { type: 'string', description: 'Date - YYYY-MM-DD or relative like "friday", "tomorrow"' },
-                time: { type: 'string', description: 'Preferred time like "noon", "7pm", "around 8"' },
-                party_size: { type: 'number', default: 2, description: 'Number of guests' },
-                book: { type: 'boolean', default: true, description: 'Auto-book best slot (true) or just show options (false)' },
-            },
-            required: ['restaurant', 'location', 'date', 'time', 'party_size'],
-        },
-    },
-    {
-        name: 'search_restaurant',
-        description: 'Search for a restaurant by name and location. Returns matching restaurants with their IDs.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                name: { type: 'string', description: 'Restaurant name to search for' },
-                location: { type: 'string', description: 'City or neighborhood' },
-                date: { type: 'string', description: 'Optional date for context (YYYY-MM-DD)' },
-                party_size: { type: 'number', default: 2, description: 'Party size' },
-            },
-            required: ['name', 'location'],
-        },
-    },
-    {
-        name: 'get_restaurant',
-        description: 'Look up a restaurant by its platform-specific ID. Returns full details including name, address, cuisine, hours, contact info, and booking options.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                restaurant_id: { type: 'string', description: 'Restaurant ID (e.g., resy-12345, opentable-67890, tock-venue-slug)' },
-            },
-            required: ['restaurant_id'],
-        },
-    },
-    {
-        name: 'get_restaurants',
-        description: 'Look up multiple restaurants by their IDs in a single call.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                restaurant_ids: { type: 'array', items: { type: 'string' }, description: 'Array of restaurant IDs to look up' },
-            },
-            required: ['restaurant_ids'],
-        },
-    },
-    {
-        name: 'check_availability',
-        description: 'Get available time slots for a specific restaurant on a given date.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                restaurant_id: { type: 'string', description: 'Restaurant ID (e.g., resy-12345)' },
-                date: { type: 'string', description: 'Date to check (YYYY-MM-DD)' },
-                party_size: { type: 'number', description: 'Number of guests' },
-            },
-            required: ['restaurant_id', 'date', 'party_size'],
-        },
-    },
-    {
-        name: 'make_reservation',
-        description: 'Book a reservation. For Resy, completes booking directly. For OpenTable/Tock, returns a booking URL.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                restaurant_id: { type: 'string', description: 'Restaurant ID' },
-                slot_id: { type: 'string', description: 'Time slot ID from check_availability' },
-                party_size: { type: 'number', description: 'Number of guests' },
-                date: { type: 'string', description: 'Reservation date (YYYY-MM-DD)' },
-            },
-            required: ['restaurant_id', 'slot_id', 'party_size', 'date'],
-        },
-    },
-    {
-        name: 'get_booking_options',
-        description: 'Get all ways to book a restaurant: API booking, website URLs, and phone number.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                restaurant_id: { type: 'string', description: 'Restaurant ID' },
-            },
-            required: ['restaurant_id'],
-        },
-    },
-    {
-        name: 'list_reservations',
-        description: 'View your upcoming reservations.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                platform: { type: 'string', enum: ['resy', 'opentable', 'tock', 'all'], default: 'all', description: 'Platform filter' },
-            },
-        },
-    },
-    {
-        name: 'cancel_reservation',
-        description: 'Cancel an existing reservation.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                reservation_id: { type: 'string', description: 'Reservation ID to cancel' },
-                platform: { type: 'string', enum: ['resy', 'opentable', 'tock'], description: 'Platform' },
-            },
-            required: ['reservation_id', 'platform'],
-        },
-    },
-    {
-        name: 'set_credentials',
-        description: 'Securely store API credentials for Resy or OpenTable.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                platform: { type: 'string', enum: ['resy', 'opentable'], description: 'Platform' },
-                api_key: { type: 'string', description: 'API key (required for Resy)' },
-                auth_token: { type: 'string', description: 'Authentication token' },
-            },
-            required: ['platform'],
-        },
-    },
-    {
-        name: 'set_login',
-        description: 'Store email/password for automatic token refresh. Credentials are encrypted.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                platform: { type: 'string', enum: ['resy'], description: 'Platform (currently only Resy)' },
-                email: { type: 'string', description: 'Account email' },
-                password: { type: 'string', description: 'Account password' },
-            },
-            required: ['platform', 'email', 'password'],
-        },
-    },
-    {
-        name: 'check_auth_status',
-        description: 'Check if credentials are configured and valid for each platform.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                platform: { type: 'string', enum: ['resy', 'opentable', 'tock', 'all'], default: 'all', description: 'Platform to check' },
-            },
-        },
-    },
-    {
-        name: 'refresh_token',
-        description: 'Manually refresh authentication token using stored login credentials.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                platform: { type: 'string', enum: ['resy'], description: 'Platform' },
-            },
-            required: ['platform'],
-        },
-    },
-    {
-        name: 'snipe_reservation',
-        description: 'Schedule an automatic booking attempt for when slots become available. Perfect for popular restaurants.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                restaurant_id: { type: 'string', description: 'Restaurant ID' },
-                platform: { type: 'string', enum: ['resy', 'opentable'], description: 'Platform' },
-                date: { type: 'string', description: 'Target reservation date (YYYY-MM-DD)' },
-                party_size: { type: 'number', description: 'Number of guests' },
-                preferred_times: { type: 'array', items: { type: 'string' }, description: 'Preferred times in order' },
-                release_time: { type: 'string', description: 'When slots open (ISO 8601)' },
-            },
-            required: ['restaurant_id', 'platform', 'date', 'party_size', 'preferred_times', 'release_time'],
-        },
-    },
-    {
-        name: 'list_snipes',
-        description: 'View all scheduled snipe attempts and their status.',
-        inputSchema: {
-            type: 'object',
-            properties: {},
-        },
-    },
-    {
-        name: 'cancel_snipe',
-        description: 'Cancel a scheduled snipe attempt.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                snipe_id: { type: 'string', description: 'Snipe ID to cancel' },
-            },
-            required: ['snipe_id'],
-        },
-    },
-    {
-        name: 'get_platform_status',
-        description: 'Check the health and rate limit status of all platforms.',
-        inputSchema: {
-            type: 'object',
-            properties: {},
-        },
-    },
-];
-// Handler functions shared by both transports
-const listToolsHandler = async () => {
-    return { tools };
-};
-const callToolHandler = async (request) => {
-    const { name, arguments: args } = request.params;
-    try {
-        switch (name) {
-            case 'find_table': {
-                const input = findTableSchema.parse(args);
-                const result = await findTable(input.restaurant, input.location, input.date, input.time, input.party_size, input.book);
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-            }
-            case 'search_restaurant': {
-                const input = searchRestaurantSchema.parse(args);
-                const result = await searchRestaurant(input.name, input.location, input.date, input.party_size);
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-            }
-            case 'get_restaurant': {
-                const input = getRestaurantSchema.parse(args);
-                const result = await getRestaurantById(input.restaurant_id);
-                if (result.error) {
-                    return { content: [{ type: 'text', text: JSON.stringify({ error: result.error }, null, 2) }] };
-                }
-                if (!result.restaurant) {
-                    return { content: [{ type: 'text', text: JSON.stringify({ error: 'Restaurant not found' }, null, 2) }] };
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(result.restaurant, null, 2) }] };
-            }
-            case 'get_restaurants': {
-                const input = getRestaurantsSchema.parse(args);
-                const results = await getRestaurantsByIds(input.restaurant_ids);
-                const output = results.map((r) => ({
-                    id: r.restaurant?.id,
-                    name: r.restaurant?.name,
-                    platform: r.platform,
-                    found: r.restaurant !== null,
-                    error: r.error,
-                    details: r.restaurant,
-                }));
-                return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }] };
-            }
-            case 'check_availability': {
-                const input = checkAvailabilitySchema.parse(args);
-                const result = await checkAvailability(input.restaurant_id, input.date, input.party_size);
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-            }
-            case 'make_reservation': {
-                const input = makeReservationSchema.parse(args);
-                const parsed = parseRestaurantId(input.restaurant_id);
-                if (!parsed) {
-                    return { content: [{ type: 'text', text: `Invalid restaurant ID: ${input.restaurant_id}` }] };
-                }
-                const client = getPlatformClient(parsed.platform);
-                const params = {
-                    restaurantId: input.restaurant_id,
-                    platform: parsed.platform,
-                    slotId: input.slot_id,
-                    date: input.date,
-                    partySize: input.party_size,
-                };
-                const result = await client.makeReservation(params);
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-            }
-            case 'get_booking_options': {
-                const input = getBookingOptionsSchema.parse(args);
-                const options = await getBookingOptions(input.restaurant_id);
-                return { content: [{ type: 'text', text: JSON.stringify(options, null, 2) }] };
-            }
-            case 'list_reservations': {
-                const input = listReservationsSchema.parse(args);
-                const results = [];
-                if (input.platform === 'resy' || input.platform === 'all') {
-                    try {
-                        const resyReservations = await resyClient.getReservations();
-                        for (const r of resyReservations) {
-                            results.push({
-                                platform: 'resy',
-                                reservationId: r.reservationId,
-                                restaurantName: r.venue.name,
-                                location: r.venue.location,
-                                date: r.date,
-                                time: r.time,
-                                partySize: r.partySize,
-                                status: r.status,
-                            });
-                        }
-                    }
-                    catch {
-                        // Skip if not authenticated
-                    }
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
-            }
-            case 'cancel_reservation': {
-                const input = cancelReservationSchema.parse(args);
-                if (input.platform === 'resy') {
-                    try {
-                        await resyClient.cancelReservation(input.reservation_id);
-                        return { content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'Reservation cancelled successfully' }, null, 2) }] };
-                    }
-                    catch (error) {
-                        return { content: [{ type: 'text', text: JSON.stringify({ success: false, message: error instanceof Error ? error.message : 'Failed to cancel' }, null, 2) }] };
-                    }
-                }
-                else {
-                    return { content: [{ type: 'text', text: JSON.stringify({ success: false, message: `${input.platform} reservations must be cancelled on their website` }, null, 2) }] };
-                }
-            }
-            case 'set_credentials': {
-                const input = setCredentialsSchema.parse(args);
-                const stored = [];
-                if (input.platform === 'resy') {
-                    if (input.api_key) {
-                        await setCredential('resy-api-key', input.api_key);
-                        stored.push('API key');
-                    }
-                    if (input.auth_token) {
-                        await setCredential('resy-auth-token', input.auth_token);
-                        stored.push('auth token');
-                    }
-                }
-                else {
-                    if (input.auth_token) {
-                        await setCredential('opentable-token', input.auth_token);
-                        stored.push('auth token');
-                    }
-                }
-                return {
-                    content: [{
-                            type: 'text',
-                            text: stored.length > 0
-                                ? `Stored ${stored.join(' and ')} for ${input.platform}.`
-                                : 'No credentials provided to store.',
-                        }],
-                };
-            }
-            case 'set_login': {
-                const input = setLoginSchema.parse(args);
-                if (input.platform === 'resy') {
-                    try {
-                        await resyClient.login(input.email, input.password);
-                        return {
-                            content: [{
-                                    type: 'text',
-                                    text: 'Login successful! Credentials stored securely. Token will auto-refresh when needed.',
-                                }],
-                        };
-                    }
-                    catch (error) {
-                        return {
-                            content: [{
-                                    type: 'text',
-                                    text: `Login failed: ${error instanceof Error ? error.message : 'Invalid credentials'}`,
-                                }],
-                        };
-                    }
-                }
-                return { content: [{ type: 'text', text: 'Only Resy login is currently supported.' }] };
-            }
-            case 'check_auth_status': {
-                const input = checkAuthStatusSchema.parse(args);
-                const statuses = [];
-                if (input.platform === 'resy' || input.platform === 'all') {
-                    const status = await getResyAuthStatus();
-                    const isValid = status.hasAuthToken ? await resyClient.isAuthenticated() : false;
-                    statuses.push({ ...status, isValid });
-                }
-                if (input.platform === 'opentable' || input.platform === 'all') {
-                    const status = await getOpenTableAuthStatus();
-                    statuses.push({ ...status, isValid: true });
-                }
-                if (input.platform === 'tock' || input.platform === 'all') {
-                    statuses.push({
-                        platform: 'tock',
-                        hasApiKey: false,
-                        hasAuthToken: false,
-                        hasLogin: false,
-                        isValid: true, // Tock works without auth
-                    });
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(statuses, null, 2) }] };
-            }
-            case 'refresh_token': {
-                const input = refreshTokenSchema.parse(args);
-                if (input.platform === 'resy') {
-                    const email = await getCredential('resy-email');
-                    const password = await getCredential('resy-password');
-                    if (!email || !password) {
-                        return {
-                            content: [{
-                                    type: 'text',
-                                    text: 'No login credentials stored. Use set_login first.',
-                                }],
-                        };
-                    }
-                    try {
-                        await resyClient.login(email, password);
-                        return { content: [{ type: 'text', text: 'Token refreshed successfully!' }] };
-                    }
-                    catch (error) {
-                        return {
-                            content: [{
-                                    type: 'text',
-                                    text: `Token refresh failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
-                                }],
-                        };
-                    }
-                }
-                return { content: [{ type: 'text', text: 'Only Resy token refresh is supported.' }] };
-            }
-            case 'snipe_reservation': {
-                const input = snipeReservationSchema.parse(args);
-                const result = await snipeReservation(input);
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-            }
-            case 'list_snipes': {
-                const input = listSnipesSchema.parse(args);
-                const results = await listScheduledSnipes(input);
-                return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
-            }
-            case 'cancel_snipe': {
-                const input = cancelSnipeSchema.parse(args);
-                const result = await cancelSnipe(input);
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-            }
-            case 'get_platform_status': {
-                const health = await getPlatformHealth();
-                const rateLimits = rateLimiter.getAllStatus();
-                const cacheStats = cache.stats();
-                const status = {
-                    platforms: Object.entries(health).map(([platform, available]) => ({
-                        platform,
-                        available,
-                        rateLimit: rateLimits.find((r) => r.platform === platform),
-                    })),
-                    cache: cacheStats,
-                };
-                return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
-            }
-            default:
-                return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
-        }
-    }
-    catch (error) {
-        if (error instanceof z.ZodError) {
-            return {
-                content: [{
-                        type: 'text',
-                        text: `Invalid input: ${error.errors.map((e) => `${e.path.join('.')}: ${e.message}`).join(', ')}`,
-                    }],
-            };
-        }
-        return {
-            content: [{
-                    type: 'text',
-                    text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
-                }],
-        };
-    }
-};
-// Handler registration is done in createMcpServer() above
+// Create single MCP server instance (stateless, matches working schwab pattern)
+const mcpServer = new McpServer({ name: 'restaurant-reservations', version: '2.0.0' });
+registerTools(mcpServer);
+// Stateless HTTP transport — single shared instance (Poke-compatible)
+const httpTransport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined, // Stateless mode
+});
+// Connect once at startup
+(async () => {
+    await mcpServer.connect(httpTransport);
+    console.log('[MCP] HTTP transport connected');
+})();
 // Start server
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const MCP_API_KEY = process.env.MCP_API_KEY || '';
@@ -573,31 +234,21 @@ const app = express();
 // CORS middleware for Poke
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization, Mcp-Session-Id, Mcp-Protocol-Version');
-    res.header('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
     if (req.method === 'OPTIONS') {
         return res.sendStatus(200);
     }
     next();
 });
 app.use(express.json({ limit: '1mb' }));
-// Log all /mcp requests for debugging
-app.use('/mcp', (req, _res, next) => {
-    console.log(`[MCP] ${req.method} /mcp Accept: ${req.headers['accept']} Auth: ${req.headers['authorization'] ? 'Bearer ***' : 'none'} Content-Type: ${req.headers['content-type']}`);
-    if (req.method === 'POST' && req.body) {
-        console.log(`[MCP] Body method: ${req.body?.method}`);
-    }
-    next();
-});
 // Health check
 app.get('/health', (_req, res) => {
     res.json({ status: 'ok', service: 'restaurant-mcp', version: '2.0.0' });
 });
-// API key auth: checks Authorization: Bearer <MCP_API_KEY>. Skips if no key configured.
+// API key auth
 function requireApiKey(req, res, next) {
-    if (!MCP_API_KEY)
-        return next();
+    if (!MCP_API_KEY) return next();
     const authHeader = req.headers.authorization || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
     if (token !== MCP_API_KEY) {
@@ -605,28 +256,25 @@ function requireApiKey(req, res, next) {
     }
     next();
 }
-// Streamable HTTP transport — stateful sessions (matches working airlabs pattern)
+// Handle all MCP requests via POST /mcp
 app.post('/mcp', requireApiKey, async (req, res) => {
-    const body = req.body;
-    if (isInitializeRequest(body)) {
-        const { sessionId, session } = createSession();
-        sessions.set(sessionId, session);
-        await session.server.connect(session.transport);
-        session.lastSeen = Date.now();
-        console.log(`[MCP] New session ${sessionId.slice(0, 8)} - initialize`);
-        return session.transport.handleRequest(req, res, body);
+    try {
+        await httpTransport.handleRequest(req, res, req.body);
+    } catch (err) {
+        if (!res.headersSent) {
+            res.status(500).json({ error: 'MCP request failed' });
+        }
     }
-    const sessionId = req.header('Mcp-Session-Id') || undefined;
-    if (!sessionId) {
-        return res.status(400).json({ error: 'Missing Mcp-Session-Id header. Re-initialize.' });
+});
+// Handle GET /mcp for SSE streaming
+app.get('/mcp', requireApiKey, async (req, res) => {
+    try {
+        await httpTransport.handleRequest(req, res);
+    } catch (err) {
+        if (!res.headersSent) {
+            res.status(500).json({ error: 'MCP request failed' });
+        }
     }
-    const session = sessions.get(sessionId);
-    if (!session) {
-        return res.status(404).json({ error: 'Unknown session. Re-initialize.' });
-    }
-    session.lastSeen = Date.now();
-    console.log(`[MCP] Session ${sessionId.slice(0, 8)} - ${body?.method || 'unknown'}`);
-    return session.transport.handleRequest(req, res, body);
 });
 async function main() {
     await startScheduler();

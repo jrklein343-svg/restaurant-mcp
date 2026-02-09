@@ -1,7 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import crypto from 'crypto';
 import express from 'express';
 import { z } from 'zod';
 
@@ -111,26 +109,6 @@ const checkAuthStatusSchema = z.object({
 const refreshTokenSchema = z.object({
   platform: z.enum(['resy']).describe('Platform to refresh token for'),
 });
-
-// Session management for stateful MCP connections
-type Session = {
-  server: McpServer;
-  transport: StreamableHTTPServerTransport;
-  lastSeen: number;
-};
-
-const sessions = new Map<string, Session>();
-const SESSION_TTL_MS = 30 * 60 * 1000;
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, s] of sessions.entries()) {
-    if (now - s.lastSeen > SESSION_TTL_MS) {
-      try { s.transport.close?.(); } catch {}
-      sessions.delete(id);
-    }
-  }
-}, 60_000).unref();
 
 function registerTools(server: McpServer) {
   server.tool('find_table', 'Find and book a table at a restaurant.', findTableSchema.shape, async (args) => {
@@ -296,15 +274,20 @@ function registerTools(server: McpServer) {
   });
 }
 
-function createSession() {
-  const sessionId = crypto.randomUUID();
-  const server = new McpServer({ name: 'restaurant-reservations', version: '2.0.0' });
-  registerTools(server);
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => sessionId,
-  });
-  return { sessionId, session: { server, transport, lastSeen: Date.now() } };
-}
+// Create single MCP server instance (stateless, matches working schwab pattern)
+const mcpServer = new McpServer({ name: 'restaurant-reservations', version: '2.0.0' });
+registerTools(mcpServer);
+
+// Stateless HTTP transport — single shared instance (Poke-compatible)
+const httpTransport = new StreamableHTTPServerTransport({
+  sessionIdGenerator: undefined, // Stateless mode
+});
+
+// Connect once at startup
+(async () => {
+  await mcpServer.connect(httpTransport);
+  console.log('[MCP] HTTP transport connected');
+})();
 
 // Start server
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -315,9 +298,8 @@ const app = express();
 // CORS middleware for Poke
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization, Mcp-Session-Id, Mcp-Protocol-Version');
-  res.header('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
@@ -326,21 +308,12 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '1mb' }));
 
-// Log all /mcp requests for debugging
-app.use('/mcp', (req, _res, next) => {
-  console.log(`[MCP] ${req.method} /mcp Accept: ${req.headers['accept']} Auth: ${req.headers['authorization'] ? 'Bearer ***' : 'none'} Content-Type: ${req.headers['content-type']}`);
-  if (req.method === 'POST' && req.body) {
-    console.log(`[MCP] Body method: ${req.body?.method}`);
-  }
-  next();
-});
-
 // Health check
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'restaurant-mcp', version: '2.0.0' });
 });
 
-// API key auth: checks Authorization: Bearer <MCP_API_KEY>. Skips if no key configured.
+// API key auth
 function requireApiKey(req: express.Request, res: express.Response, next: express.NextFunction) {
   if (!MCP_API_KEY) return next();
   const authHeader = req.headers.authorization || '';
@@ -351,31 +324,26 @@ function requireApiKey(req: express.Request, res: express.Response, next: expres
   next();
 }
 
-// Streamable HTTP transport — stateful sessions (matches working airlabs pattern)
+// Handle all MCP requests via POST /mcp
 app.post('/mcp', requireApiKey, async (req, res) => {
-  const body = req.body;
-
-  if (isInitializeRequest(body)) {
-    const { sessionId, session } = createSession();
-    sessions.set(sessionId, session);
-    await session.server.connect(session.transport);
-    session.lastSeen = Date.now();
-    console.log(`[MCP] New session ${sessionId.slice(0, 8)} - initialize`);
-    return session.transport.handleRequest(req, res, body);
+  try {
+    await httpTransport.handleRequest(req, res, req.body);
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'MCP request failed' });
+    }
   }
+});
 
-  const sessionId = req.header('Mcp-Session-Id') || undefined;
-  if (!sessionId) {
-    return res.status(400).json({ error: 'Missing Mcp-Session-Id header. Re-initialize.' });
+// Handle GET /mcp for SSE streaming
+app.get('/mcp', requireApiKey, async (req, res) => {
+  try {
+    await httpTransport.handleRequest(req, res);
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'MCP request failed' });
+    }
   }
-  const session = sessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'Unknown session. Re-initialize.' });
-  }
-
-  session.lastSeen = Date.now();
-  console.log(`[MCP] Session ${sessionId.slice(0, 8)} - ${body?.method || 'unknown'}`);
-  return session.transport.handleRequest(req, res, body);
 });
 
 async function main() {
