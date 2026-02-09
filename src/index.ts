@@ -1,11 +1,9 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import http from 'http';
-import crypto from 'crypto';
 import { z } from 'zod';
 
 import {
@@ -658,148 +656,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// Start server
-const PORT = parseInt(process.env.PORT || '3000', 10);
-
+// Start server via stdio transport
 async function main() {
   // Start the snipe scheduler
   await startScheduler();
 
-  // Track active transports by session ID
-  const transports = new Map<string, StreamableHTTPServerTransport>();
-
-  // Create HTTP server with Streamable HTTP transport
-  const httpServer = http.createServer(async (req, res) => {
-    const url = new URL(req.url || '/', `http://${req.headers.host}`);
-
-    // CORS headers - required for browser-based clients
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Mcp-Session-Id');
-    res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
-
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-
-    // Health check
-    if (url.pathname === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', service: 'restaurant-mcp', version: '2.0.0' }));
-      return;
-    }
-
-    // MCP endpoint - handles both GET (SSE) and POST (messages)
-    if (url.pathname === '/mcp' || url.pathname === '/sse' || url.pathname === '/') {
-      console.log(`MCP request: ${req.method} ${url.pathname}`);
-
-      // Get or create session
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
-
-      if (sessionId && transports.has(sessionId)) {
-        // Existing session
-        const transport = transports.get(sessionId)!;
-
-        // Parse body for POST requests
-        if (req.method === 'POST') {
-          let body = '';
-          req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
-          req.on('end', async () => {
-            try {
-              const parsedBody = body ? JSON.parse(body) : undefined;
-              await transport.handleRequest(req, res, parsedBody);
-            } catch (error) {
-              console.error('Request handling error:', error);
-              if (!res.headersSent) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Invalid request' }));
-              }
-            }
-          });
-        } else if (req.method === 'GET') {
-          // GET for SSE stream
-          await transport.handleRequest(req, res);
-        } else if (req.method === 'DELETE') {
-          // Session termination
-          transports.delete(sessionId);
-          res.writeHead(204);
-          res.end();
-        } else {
-          res.writeHead(405, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Method not allowed' }));
-        }
-      } else if (req.method === 'POST') {
-        // New session - create transport
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => crypto.randomUUID(),
-        });
-
-        // Connect to MCP server
-        await server.connect(transport);
-
-        // Store transport by session ID once it's assigned
-        transport.onclose = () => {
-          if (transport.sessionId) {
-            console.log(`Session closed: ${transport.sessionId}`);
-            transports.delete(transport.sessionId);
-          }
-        };
-
-        // Parse body and handle request
-        let body = '';
-        req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
-        req.on('end', async () => {
-          try {
-            const parsedBody = body ? JSON.parse(body) : undefined;
-            await transport.handleRequest(req, res, parsedBody);
-
-            // Store transport after handling (session ID is now set)
-            if (transport.sessionId) {
-              console.log(`New session: ${transport.sessionId}`);
-              transports.set(transport.sessionId, transport);
-            }
-          } catch (error) {
-            console.error('Request handling error:', error);
-            if (!res.headersSent) {
-              res.writeHead(400, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: 'Invalid request' }));
-            }
-          }
-        });
-      } else if (req.method === 'GET' && !sessionId) {
-        // GET without session - invalid
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Session ID required for GET requests' }));
-      } else {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid request' }));
-      }
-      return;
-    }
-
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
-  });
-
-  httpServer.listen(PORT, () => {
-    console.log(`Restaurant MCP server running on port ${PORT}`);
-    console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
-  });
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('Restaurant MCP server running on stdio');
 
   // Cleanup on exit
   process.on('SIGINT', () => {
     cache.destroy();
     stopScheduler();
-    httpServer.close();
     process.exit(0);
   });
 
   process.on('SIGTERM', () => {
     cache.destroy();
     stopScheduler();
-    httpServer.close();
     process.exit(0);
   });
 }

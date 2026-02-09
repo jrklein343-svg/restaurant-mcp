@@ -14,12 +14,10 @@ import type {
   ReservationResult,
   SearchQuery,
   PriceRange,
-  ErrorCode,
   ReservationError,
 } from '../types/restaurant.js';
 import { cache, CacheKeys, CacheTTL } from '../services/cache.js';
 import { rateLimiter } from '../services/rate-limiter.js';
-import { parseCuisines } from '../utils/normalize.js';
 
 const BASE_URL = 'https://api.resy.com';
 
@@ -41,34 +39,6 @@ interface ResyFindResponse {
   };
 }
 
-interface ResyVenueDetailsResponse {
-  id: { resy: number };
-  name: string;
-  tagline?: string;
-  type?: string;
-  location: {
-    name: string;
-    neighborhood: string;
-    address_1: string;
-    address_2?: string;
-    locality: string;
-    region: string;
-    postal_code: string;
-    time_zone: string;
-    geo?: { lat: number; lon: number };
-  };
-  contact: {
-    phone_number?: string;
-    url?: string;
-  };
-  cuisine: string[] | string;
-  price_range: number;
-  rating: number;
-  num_ratings?: number;
-  images: string[];
-  content?: Array<{ title: string; body: string }>;
-  social?: Array<{ type: string; url: string }>;
-}
 
 interface ResySlot {
   config: { id: number; type: string; token: string };
@@ -215,52 +185,9 @@ export class ResyPlatformClient extends BasePlatformClient {
   async search(query: SearchQuery): Promise<Restaurant[]> {
     const date = query.date || this.today();
     const partySize = query.partySize || 2;
-
-    // Get location info for slug
-    const locationSlug = this.getLocationSlug(query.location);
-
-    console.log(`Resy search starting: "${query.query}" in "${query.location}" (${locationSlug})`);
-    const startTime = Date.now();
-
-    // Try direct venue lookup first (fast, reliable)
-    try {
-      const venueSlug = this.nameToSlug(query.query, query.location);
-      console.log(`Trying direct venue lookup with slug: ${venueSlug}`);
-
-      const venueData = await this.client.get<ResyVenueDetailsResponse>('/3/venue', {
-        headers: this.getHeaders(),
-        params: { url_slug: venueSlug, location: locationSlug },
-        timeout: 10000,
-      });
-
-      if (venueData.data?.id?.resy) {
-        const elapsed = Date.now() - startTime;
-        console.log(`Resy direct lookup succeeded in ${elapsed}ms`);
-
-        // Convert to ResyVenueHit format
-        const hit: ResyVenueHit = {
-          id: { resy: venueData.data.id.resy },
-          name: venueData.data.name,
-          location: {
-            name: venueData.data.location.name,
-            neighborhood: venueData.data.location.neighborhood,
-            time_zone: venueData.data.location.time_zone,
-          },
-          cuisine: venueData.data.cuisine,
-          price_range: venueData.data.price_range,
-          rating: venueData.data.rating,
-          images: venueData.data.images,
-        };
-        return [this.mapToRestaurant(hit)];
-      }
-    } catch (directError) {
-      const elapsed = Date.now() - startTime;
-      console.log(`Direct lookup failed after ${elapsed}ms:`, directError instanceof Error ? directError.message : 'unknown');
-    }
-
-    // Fallback: try /4/find with short timeout
-    console.log('Trying /4/find search...');
     const coords = this.getCityCoordinates(query.location);
+
+    console.error(`Resy search: "${query.query}" in "${query.location}"`);
 
     try {
       const findData = await this.client.get<ResyFindResponse>('/4/find', {
@@ -272,29 +199,16 @@ export class ResyPlatformClient extends BasePlatformClient {
           party_size: partySize,
           query: query.query,
         },
-        timeout: 10000, // Short timeout
+        timeout: 10000,
       });
 
-      const elapsed = Date.now() - startTime;
-      console.log(`Resy /4/find completed in ${elapsed}ms: ${findData.data?.search?.hits?.length || 0} results`);
-      return (findData.data?.search?.hits || []).map((hit) => this.mapToRestaurant(hit));
-    } catch (findError) {
-      const elapsed = Date.now() - startTime;
-      console.error(`Resy search failed after ${elapsed}ms:`, findError instanceof Error ? findError.message : findError);
+      const hits = findData.data?.search?.hits || [];
+      console.error(`Resy search found ${hits.length} results`);
+      return hits.map((hit) => this.mapToRestaurant(hit));
+    } catch (error) {
+      console.error('Resy search error:', error instanceof Error ? error.message : error);
       return [];
     }
-  }
-
-  private nameToSlug(name: string, _location: string): string {
-    // Convert restaurant name to URL slug format
-    // Resy uses just the restaurant name, not location
-    // e.g., "Carbone" -> "carbone", "The Grill" -> "the-grill"
-    return name.toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, '')
-      .replace(/\s+/g, '-')
-      .replace(/-+/g, '-')
-      .replace(/^-|-$/g, '') // Remove leading/trailing dashes
-      .trim();
   }
 
   private getLocationSlug(location: string): string {
@@ -390,11 +304,42 @@ export class ResyPlatformClient extends BasePlatformClient {
     if (cached) return cached;
 
     try {
-      const data = await this.request<ResyVenueDetailsResponse>('get', `/4/venue`, {
-        id: numericId,
+      // Use /4/find with venue_id to get venue info (same endpoint as availability)
+      const data = await this.request<ResyVenueSlotsResponse>('get', '/4/find', {
+        lat: 0,
+        long: 0,
+        day: this.today(),
+        party_size: 2,
+        venue_id: numericId,
       });
 
-      const details = this.mapToDetails(data);
+      const venue = data.results?.venues?.[0];
+      if (!venue) return null;
+
+      // Build details from the find response
+      const details: RestaurantDetails = {
+        id: this.createId(numericId),
+        platformIds: { resy: numericId },
+        name: venue.venue.name,
+        cuisines: [],
+        priceRange: 2 as PriceRange,
+        rating: 0,
+        reviewCount: 0,
+        address: {
+          street: '',
+          city: '',
+          state: '',
+          zip: '',
+        },
+        acceptsOnlineReservations: true,
+        reservationPlatforms: [this.name],
+        bookingUrls: {
+          resy: `https://resy.com/cities/ny/venues/${numericId}`,
+        },
+        images: [],
+        lastUpdated: new Date().toISOString(),
+      };
+
       cache.set(cacheKey, details, CacheTTL.RESTAURANT_DETAILS);
       return details;
     } catch (error) {
@@ -482,24 +427,17 @@ export class ResyPlatformClient extends BasePlatformClient {
 
     try {
       await this.ensureCredentials();
-      // Simple health check - use venue endpoint which is faster
-      const response = await this.client.get('/3/venue', {
+      // Health check using /4/find which is the working search endpoint
+      const response = await this.client.get('/4/find', {
         headers: this.getHeaders(),
-        params: { url_slug: 'american-beauty-at-the-grove', location: 'los-angeles-ca' },
-        timeout: 15000,
+        params: { lat: 40.7128, long: -73.9352, day: this.today(), party_size: 2 },
+        timeout: 10000,
       });
       const available = response.status === 200;
       cache.set(cacheKey, available, CacheTTL.PLATFORM_HEALTH);
-      console.log('Resy isAvailable: SUCCESS');
       return available;
     } catch (error) {
       console.error('Resy isAvailable error:', error instanceof Error ? error.message : error);
-      if (error instanceof AxiosError) {
-        console.error('Resy API error details:', {
-          status: error.response?.status,
-          data: typeof error.response?.data === 'string' ? error.response.data.substring(0, 200) : error.response?.data,
-        });
-      }
       cache.set(cacheKey, false, CacheTTL.PLATFORM_HEALTH);
       return false;
     }
@@ -590,40 +528,6 @@ export class ResyPlatformClient extends BasePlatformClient {
       priceRange: hit.price_range || 0,
       rating: hit.rating || 0,
       imageUrl: hit.images?.[0],
-    };
-  }
-
-  private mapToDetails(data: ResyVenueDetailsResponse): RestaurantDetails {
-    const cuisines = Array.isArray(data.cuisine) ? data.cuisine : parseCuisines(data.cuisine || '');
-
-    return {
-      id: this.createId(data.id.resy),
-      platformIds: { resy: data.id.resy },
-      name: data.name,
-      description: data.tagline || data.content?.[0]?.body,
-      cuisines,
-      priceRange: (data.price_range || 2) as PriceRange,
-      rating: data.rating || 0,
-      reviewCount: data.num_ratings || 0,
-      address: {
-        street: [data.location.address_1, data.location.address_2].filter(Boolean).join(', '),
-        city: data.location.locality,
-        state: data.location.region,
-        zip: data.location.postal_code,
-        neighborhood: data.location.neighborhood,
-        coordinates: data.location.geo
-          ? { lat: data.location.geo.lat, lng: data.location.geo.lon }
-          : undefined,
-      },
-      phone: data.contact?.phone_number,
-      website: data.contact?.url,
-      acceptsOnlineReservations: true,
-      reservationPlatforms: [this.name],
-      bookingUrls: {
-        resy: `https://resy.com/cities/${data.location.locality.toLowerCase().replace(/\s+/g, '-')}/venues/${data.id.resy}`,
-      },
-      images: data.images || [],
-      lastUpdated: new Date().toISOString(),
     };
   }
 
