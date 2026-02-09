@@ -1,10 +1,11 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js';
+import crypto from 'crypto';
 import express from 'express';
 import { z } from 'zod';
 
@@ -115,30 +116,45 @@ const refreshTokenSchema = z.object({
   platform: z.enum(['resy']).describe('Platform to refresh token for'),
 });
 
-// Create servers - one for SSE transport, one for HTTP transport
-const server = new Server(
-  {
-    name: 'restaurant-reservations',
-    version: '2.0.0',
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
+// Session management for stateful MCP connections
+type Session = {
+  server: Server;
+  transport: StreamableHTTPServerTransport;
+  lastSeen: number;
+};
 
-const serverHTTP = new Server(
-  {
-    name: 'restaurant-reservations',
-    version: '2.0.0',
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
+const sessions = new Map<string, Session>();
+const SESSION_TTL_MS = 30 * 60 * 1000;
+
+// Clean up stale sessions
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of sessions.entries()) {
+    if (now - s.lastSeen > SESSION_TTL_MS) {
+      try { s.transport.close?.(); } catch {}
+      sessions.delete(id);
+    }
   }
-);
+}, 60_000).unref();
+
+function createMcpServer(): Server {
+  const s = new Server(
+    { name: 'restaurant-reservations', version: '2.0.0' },
+    { capabilities: { tools: {} } }
+  );
+  s.setRequestHandler(ListToolsRequestSchema, listToolsHandler);
+  s.setRequestHandler(CallToolRequestSchema, callToolHandler as Parameters<typeof s.setRequestHandler>[1]);
+  return s;
+}
+
+function createSession() {
+  const sessionId = crypto.randomUUID();
+  const server = createMcpServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => sessionId,
+  });
+  return { sessionId, session: { server, transport, lastSeen: Date.now() } };
+}
 
 // Tool definitions
 const tools = [
@@ -669,11 +685,7 @@ const callToolHandler = async (request: { params: { name: string; arguments?: Re
   }
 };
 
-// Register handlers on both servers
-server.setRequestHandler(ListToolsRequestSchema, listToolsHandler);
-server.setRequestHandler(CallToolRequestSchema, callToolHandler as Parameters<typeof server.setRequestHandler>[1]);
-serverHTTP.setRequestHandler(ListToolsRequestSchema, listToolsHandler);
-serverHTTP.setRequestHandler(CallToolRequestSchema, callToolHandler as Parameters<typeof serverHTTP.setRequestHandler>[1]);
+// Handler registration is done in createMcpServer() above
 
 // Start server
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -709,47 +721,6 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'restaurant-mcp', version: '2.0.0' });
 });
 
-// SSE Transport (what Poke uses)
-const sseTransports = new Map<string, SSEServerTransport>();
-
-app.get('/sse', async (req, res) => {
-  const transport = new SSEServerTransport('/messages', res);
-  const sessionId = transport.sessionId;
-  sseTransports.set(sessionId, transport);
-
-  res.on('close', () => {
-    sseTransports.delete(sessionId);
-  });
-
-  try {
-    await server.connect(transport);
-  } catch (err) {
-    console.error('SSE connect error:', err);
-  }
-});
-
-app.post('/messages', async (req, res) => {
-  const sessionId = req.query.sessionId as string;
-  const transport = sseTransports.get(sessionId);
-
-  if (transport) {
-    try {
-      await transport.handlePostMessage(req, res);
-    } catch (err) {
-      console.error('Message handle error:', err);
-      res.status(500).json({ error: 'Message handling failed' });
-    }
-  } else {
-    res.status(400).json({ error: 'No active session' });
-  }
-});
-
-// Stateless HTTP transport for MCP (Poke-compatible)
-const httpTransport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: undefined,
-  enableJsonResponse: true,
-});
-
 // API key auth: checks Authorization: Bearer <MCP_API_KEY>. Skips if no key configured.
 function requireApiKey(req: express.Request, res: express.Response, next: express.NextFunction) {
   if (!MCP_API_KEY) return next();
@@ -761,42 +732,41 @@ function requireApiKey(req: express.Request, res: express.Response, next: expres
   next();
 }
 
+// Streamable HTTP transport — stateful sessions (matches working airlabs pattern)
 app.post('/mcp', requireApiKey, async (req, res) => {
-  try {
-    await httpTransport.handleRequest(req, res, req.body);
-  } catch (err) {
-    console.error('MCP POST error:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'MCP request failed' });
-    }
-  }
-});
+  const body = req.body;
 
-app.get('/mcp', requireApiKey, async (req, res) => {
-  try {
-    await httpTransport.handleRequest(req, res);
-  } catch (err) {
-    console.error('MCP GET error:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'MCP request failed' });
-    }
+  if (isInitializeRequest(body)) {
+    const { sessionId, session } = createSession();
+    sessions.set(sessionId, session);
+    await session.server.connect(session.transport);
+    session.lastSeen = Date.now();
+    console.log(`[MCP] New session ${sessionId.slice(0, 8)} - initialize`);
+    return session.transport.handleRequest(req, res, body);
   }
+
+  const sessionId = req.header('Mcp-Session-Id') || undefined;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'Missing Mcp-Session-Id header. Re-initialize.' });
+  }
+  const session = sessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'Unknown session. Re-initialize.' });
+  }
+
+  session.lastSeen = Date.now();
+  console.log(`[MCP] Session ${sessionId.slice(0, 8)} - ${body?.method || 'unknown'}`);
+  return session.transport.handleRequest(req, res, body);
 });
 
 async function main() {
-  // Start the snipe scheduler
   await startScheduler();
-
-  // Connect HTTP transport
-  await serverHTTP.connect(httpTransport);
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Restaurant MCP server running on port ${PORT}`);
-    console.log(`MCP HTTP: http://localhost:${PORT}/mcp`);
-    console.log(`MCP SSE: http://localhost:${PORT}/sse`);
+    console.log(`MCP: http://localhost:${PORT}/mcp`);
   });
 
-  // Cleanup on exit
   process.on('SIGINT', () => {
     cache.destroy();
     stopScheduler();
