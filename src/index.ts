@@ -739,6 +739,10 @@ const httpTransport = new StreamableHTTPServerTransport({
 });
 
 app.post('/mcp', async (req, res) => {
+  // Ensure Accept header includes required types for StreamableHTTPServerTransport
+  if (!req.headers.accept || !req.headers.accept.includes('text/event-stream')) {
+    req.headers.accept = 'application/json, text/event-stream';
+  }
   try {
     await httpTransport.handleRequest(req, res, req.body);
   } catch (err) {
@@ -750,6 +754,13 @@ app.post('/mcp', async (req, res) => {
 });
 
 app.get('/mcp', async (req, res) => {
+  // If client doesn't accept text/event-stream, return a simple JSON response
+  // so Poke URL validation doesn't get a 406
+  const accept = req.headers.accept || '';
+  if (!accept.includes('text/event-stream')) {
+    res.json({ name: 'restaurant-reservations', version: '2.0.0', status: 'ok' });
+    return;
+  }
   try {
     await httpTransport.handleRequest(req, res);
   } catch (err) {
