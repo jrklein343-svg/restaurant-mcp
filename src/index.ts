@@ -680,13 +680,18 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 
 const app = express();
 
-// CORS middleware for Poke
-app.use((_req, res, next) => {
+// CORS and Accept header middleware for Poke
+app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
-  if (_req.method === 'OPTIONS') {
+  if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
+  }
+  // Ensure Accept header includes types required by StreamableHTTPServerTransport
+  const accept = req.headers.accept || '';
+  if (!accept.includes('text/event-stream')) {
+    req.headers.accept = 'application/json, text/event-stream';
   }
   next();
 });
@@ -739,10 +744,6 @@ const httpTransport = new StreamableHTTPServerTransport({
 });
 
 app.post('/mcp', async (req, res) => {
-  // Ensure Accept header includes required types for StreamableHTTPServerTransport
-  if (!req.headers.accept || !req.headers.accept.includes('text/event-stream')) {
-    req.headers.accept = 'application/json, text/event-stream';
-  }
   try {
     await httpTransport.handleRequest(req, res, req.body);
   } catch (err) {
