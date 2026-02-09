@@ -680,7 +680,7 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 
 const app = express();
 
-// CORS and Accept header middleware for Poke
+// CORS middleware for Poke
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -688,10 +688,19 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
-  // Ensure Accept header includes types required by StreamableHTTPServerTransport
-  const accept = req.headers.accept || '';
+  // StreamableHTTPServerTransport requires Accept to include text/event-stream.
+  // Poke doesn't send it, causing 406. Inject it at the raw IncomingMessage level
+  // so @hono/node-server picks it up when converting to Web Standard Request.
+  const accept = req.headers['accept'] || '';
   if (!accept.includes('text/event-stream')) {
-    req.headers.accept = 'application/json, text/event-stream';
+    req.headers['accept'] = 'application/json, text/event-stream';
+    // Also update rawHeaders array which Hono may read
+    const idx = req.rawHeaders.findIndex(h => h.toLowerCase() === 'accept');
+    if (idx !== -1) {
+      req.rawHeaders[idx + 1] = 'application/json, text/event-stream';
+    } else {
+      req.rawHeaders.push('Accept', 'application/json, text/event-stream');
+    }
   }
   next();
 });
