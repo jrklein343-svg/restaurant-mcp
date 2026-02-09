@@ -1,4 +1,5 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
@@ -114,8 +115,20 @@ const refreshTokenSchema = z.object({
   platform: z.enum(['resy']).describe('Platform to refresh token for'),
 });
 
-// Create server
+// Create servers - one for SSE transport, one for HTTP transport
 const server = new Server(
+  {
+    name: 'restaurant-reservations',
+    version: '2.0.0',
+  },
+  {
+    capabilities: {
+      tools: {},
+    },
+  }
+);
+
+const serverHTTP = new Server(
   {
     name: 'restaurant-reservations',
     version: '2.0.0',
@@ -333,13 +346,12 @@ const tools = [
   },
 ];
 
-// List tools handler
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+// Handler functions shared by both transports
+const listToolsHandler = async () => {
   return { tools };
-});
+};
 
-// Call tool handler
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+const callToolHandler = async (request: { params: { name: string; arguments?: Record<string, unknown> } }) => {
   const { name, arguments: args } = request.params;
 
   try {
@@ -655,7 +667,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }],
     };
   }
-});
+};
+
+// Register handlers on both servers
+server.setRequestHandler(ListToolsRequestSchema, listToolsHandler);
+server.setRequestHandler(CallToolRequestSchema, callToolHandler as Parameters<typeof server.setRequestHandler>[1]);
+serverHTTP.setRequestHandler(ListToolsRequestSchema, listToolsHandler);
+serverHTTP.setRequestHandler(CallToolRequestSchema, callToolHandler as Parameters<typeof serverHTTP.setRequestHandler>[1]);
 
 // Start server
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -680,12 +698,46 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'restaurant-mcp', version: '2.0.0' });
 });
 
-// Stateless HTTP transport for MCP (Poke-compatible)
-const httpTransport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: undefined, // Stateless mode
+// SSE Transport (what Poke uses)
+const sseTransports = new Map<string, SSEServerTransport>();
+
+app.get('/sse', async (req, res) => {
+  const transport = new SSEServerTransport('/messages', res);
+  const sessionId = transport.sessionId;
+  sseTransports.set(sessionId, transport);
+
+  res.on('close', () => {
+    sseTransports.delete(sessionId);
+  });
+
+  try {
+    await server.connect(transport);
+  } catch (err) {
+    console.error('SSE connect error:', err);
+  }
 });
 
-// Handle POST /mcp
+app.post('/messages', async (req, res) => {
+  const sessionId = req.query.sessionId as string;
+  const transport = sseTransports.get(sessionId);
+
+  if (transport) {
+    try {
+      await transport.handlePostMessage(req, res);
+    } catch (err) {
+      console.error('Message handle error:', err);
+      res.status(500).json({ error: 'Message handling failed' });
+    }
+  } else {
+    res.status(400).json({ error: 'No active session' });
+  }
+});
+
+// Stateless HTTP transport for MCP
+const httpTransport = new StreamableHTTPServerTransport({
+  sessionIdGenerator: undefined,
+});
+
 app.post('/mcp', async (req, res) => {
   try {
     await httpTransport.handleRequest(req, res, req.body);
@@ -697,7 +749,6 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
-// Handle GET /mcp for SSE streaming
 app.get('/mcp', async (req, res) => {
   try {
     await httpTransport.handleRequest(req, res);
@@ -713,12 +764,13 @@ async function main() {
   // Start the snipe scheduler
   await startScheduler();
 
-  // Connect MCP server to stateless transport
-  await server.connect(httpTransport);
+  // Connect HTTP transport
+  await serverHTTP.connect(httpTransport);
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Restaurant MCP server running on port ${PORT}`);
-    console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
+    console.log(`MCP HTTP: http://localhost:${PORT}/mcp`);
+    console.log(`MCP SSE: http://localhost:${PORT}/sse`);
   });
 
   // Cleanup on exit
