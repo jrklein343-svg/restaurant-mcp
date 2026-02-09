@@ -683,24 +683,11 @@ const app = express();
 // CORS middleware for Poke
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization, Mcp-Session-Id, Mcp-Protocol-Version');
+  res.header('Access-Control-Expose-Headers', 'Mcp-Session-Id');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
-  }
-  // StreamableHTTPServerTransport requires Accept to include text/event-stream.
-  // Poke doesn't send it, causing 406. Inject it at the raw IncomingMessage level
-  // so @hono/node-server picks it up when converting to Web Standard Request.
-  const accept = req.headers['accept'] || '';
-  if (!accept.includes('text/event-stream')) {
-    req.headers['accept'] = 'application/json, text/event-stream';
-    // Also update rawHeaders array which Hono may read
-    const idx = req.rawHeaders.findIndex(h => h.toLowerCase() === 'accept');
-    if (idx !== -1) {
-      req.rawHeaders[idx + 1] = 'application/json, text/event-stream';
-    } else {
-      req.rawHeaders.push('Accept', 'application/json, text/event-stream');
-    }
   }
   next();
 });
@@ -747,7 +734,7 @@ app.post('/messages', async (req, res) => {
   }
 });
 
-// Stateless HTTP transport for MCP
+// Stateless HTTP transport for MCP (Poke-compatible)
 const httpTransport = new StreamableHTTPServerTransport({
   sessionIdGenerator: undefined,
 });
@@ -764,17 +751,21 @@ app.post('/mcp', async (req, res) => {
 });
 
 app.get('/mcp', async (req, res) => {
-  // If client doesn't accept text/event-stream, return a simple JSON response
-  // so Poke URL validation doesn't get a 406
-  const accept = req.headers.accept || '';
-  if (!accept.includes('text/event-stream')) {
-    res.json({ name: 'restaurant-reservations', version: '2.0.0', status: 'ok' });
-    return;
-  }
   try {
     await httpTransport.handleRequest(req, res);
   } catch (err) {
     console.error('MCP GET error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'MCP request failed' });
+    }
+  }
+});
+
+app.delete('/mcp', async (req, res) => {
+  try {
+    await httpTransport.handleRequest(req, res);
+  } catch (err) {
+    console.error('MCP DELETE error:', err);
     if (!res.headersSent) {
       res.status(500).json({ error: 'MCP request failed' });
     }
