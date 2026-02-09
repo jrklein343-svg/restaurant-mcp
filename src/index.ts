@@ -747,6 +747,7 @@ app.post('/messages', async (req, res) => {
 // Stateless HTTP transport for MCP (Poke-compatible)
 const httpTransport = new StreamableHTTPServerTransport({
   sessionIdGenerator: undefined,
+  enableJsonResponse: true,
 });
 
 // API key auth: checks Authorization: Bearer <MCP_API_KEY>. Skips if no key configured.
