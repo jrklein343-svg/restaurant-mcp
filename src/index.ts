@@ -677,6 +677,7 @@ serverHTTP.setRequestHandler(CallToolRequestSchema, callToolHandler as Parameter
 
 // Start server
 const PORT = parseInt(process.env.PORT || '3000', 10);
+const MCP_API_KEY = process.env.MCP_API_KEY || '';
 
 const app = express();
 
@@ -739,6 +740,17 @@ const httpTransport = new StreamableHTTPServerTransport({
   sessionIdGenerator: undefined,
 });
 
+// API key auth: checks Authorization: Bearer <MCP_API_KEY>. Skips if no key configured.
+function requireApiKey(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (!MCP_API_KEY) return next();
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  if (token !== MCP_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized - invalid or missing API key' });
+  }
+  next();
+}
+
 // Poke doesn't send Accept: text/event-stream, but the MCP SDK requires it.
 // Ensure it's present before the transport processes the request.
 function ensureMcpAcceptHeader(req: express.Request, _res: express.Response, next: express.NextFunction) {
@@ -749,7 +761,7 @@ function ensureMcpAcceptHeader(req: express.Request, _res: express.Response, nex
   next();
 }
 
-app.post('/mcp', ensureMcpAcceptHeader, async (req, res) => {
+app.post('/mcp', requireApiKey, ensureMcpAcceptHeader, async (req, res) => {
   try {
     await httpTransport.handleRequest(req, res, req.body);
   } catch (err) {
@@ -760,7 +772,7 @@ app.post('/mcp', ensureMcpAcceptHeader, async (req, res) => {
   }
 });
 
-app.get('/mcp', ensureMcpAcceptHeader, async (req, res) => {
+app.get('/mcp', requireApiKey, ensureMcpAcceptHeader, async (req, res) => {
   try {
     await httpTransport.handleRequest(req, res);
   } catch (err) {
@@ -771,7 +783,7 @@ app.get('/mcp', ensureMcpAcceptHeader, async (req, res) => {
   }
 });
 
-app.delete('/mcp', ensureMcpAcceptHeader, async (req, res) => {
+app.delete('/mcp', requireApiKey, ensureMcpAcceptHeader, async (req, res) => {
   try {
     await httpTransport.handleRequest(req, res);
   } catch (err) {
