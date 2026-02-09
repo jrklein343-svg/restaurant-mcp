@@ -751,24 +751,7 @@ function requireApiKey(req: express.Request, res: express.Response, next: expres
   next();
 }
 
-// Poke doesn't send Accept: text/event-stream, but the MCP SDK requires it.
-// Patch both req.headers and req.rawHeaders since @hono/node-server reads rawHeaders.
-function ensureMcpAcceptHeader(req: express.Request, _res: express.Response, next: express.NextFunction) {
-  const accept = req.headers['accept'] || '';
-  if (!accept.includes('text/event-stream')) {
-    const newAccept = 'application/json, text/event-stream';
-    req.headers['accept'] = newAccept;
-    const idx = req.rawHeaders.findIndex((h: string) => h.toLowerCase() === 'accept');
-    if (idx !== -1) {
-      req.rawHeaders[idx + 1] = newAccept;
-    } else {
-      req.rawHeaders.push('Accept', newAccept);
-    }
-  }
-  next();
-}
-
-app.post('/mcp', requireApiKey, ensureMcpAcceptHeader, async (req, res) => {
+app.post('/mcp', requireApiKey, async (req, res) => {
   try {
     await httpTransport.handleRequest(req, res, req.body);
   } catch (err) {
@@ -779,22 +762,11 @@ app.post('/mcp', requireApiKey, ensureMcpAcceptHeader, async (req, res) => {
   }
 });
 
-app.get('/mcp', requireApiKey, ensureMcpAcceptHeader, async (req, res) => {
+app.get('/mcp', requireApiKey, async (req, res) => {
   try {
     await httpTransport.handleRequest(req, res);
   } catch (err) {
     console.error('MCP GET error:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'MCP request failed' });
-    }
-  }
-});
-
-app.delete('/mcp', requireApiKey, ensureMcpAcceptHeader, async (req, res) => {
-  try {
-    await httpTransport.handleRequest(req, res);
-  } catch (err) {
-    console.error('MCP DELETE error:', err);
     if (!res.headersSent) {
       res.status(500).json({ error: 'MCP request failed' });
     }
